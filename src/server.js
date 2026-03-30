@@ -42,27 +42,27 @@ const sessionLogs = new Map(); // ws → { file, stream }
 function startSessionLog(ws, playerName) {
   fs.mkdirSync(LOGS_DIR, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = `${playerName}_${ts}.log`;
+  const filename = `${playerName}_${ts}.jsonl`;
   const filepath = path.join(LOGS_DIR, filename);
   const stream = fs.createWriteStream(filepath, { flags: 'a' });
-  stream.write(`=== Session: ${playerName} | ${new Date().toISOString()} ===\n\n`);
-  sessionLogs.set(ws, { file: filename, stream });
+  const startTick = tick.getTick();
+  sessionLogs.set(ws, { file: filename, stream, startTick });
   console.log(`[log] Recording session → ${filename}`);
 }
 
 function logEntry(ws, type, text) {
   const session = sessionLogs.get(ws);
   if (!session) return;
-  const elapsed = ((Date.now() % 86400000) / 1000).toFixed(1);
-  const prefix = type === 'in' ? '> ' : '  ';
-  session.stream.write(`[${elapsed}s] ${prefix}${text}\n`);
-  if (type === 'out') session.stream.write('\n');
+  const t = tick.getTick();
+  const tickOffset = t - session.startTick;
+  session.stream.write(JSON.stringify({ tick: tickOffset, type, text }) + '\n');
 }
 
 function endSessionLog(ws) {
   const session = sessionLogs.get(ws);
   if (!session) return;
-  session.stream.write(`\n=== Session ended: ${new Date().toISOString()} ===\n`);
+  const t = tick.getTick();
+  session.stream.write(JSON.stringify({ tick: t - session.startTick, type: 'end', text: 'Session ended' }) + '\n');
   session.stream.end();
   sessionLogs.delete(ws);
 }
@@ -773,20 +773,89 @@ commands.register('admin', { help: 'Toggle admin mode', category: 'Build',
 commands.register('replays', { help: 'List session recordings', category: 'General',
   fn: () => {
     if (!fs.existsSync(LOGS_DIR)) return 'No recordings yet.';
-    const files = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith('.log')).sort().reverse();
+    const files = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith('.jsonl')).sort().reverse();
     if (!files.length) return 'No recordings yet.';
-    return 'Session recordings:\n' + files.map((f, i) => `  [${i}] ${f}`).join('\n') + '\n\nType `replay [number]` to view.';
+    return 'Session recordings:\n' + files.map((f, i) => {
+      const lines = fs.readFileSync(path.join(LOGS_DIR, f), 'utf8').trim().split('\n');
+      const last = JSON.parse(lines[lines.length - 1]);
+      const ticks = last.tick;
+      const secs = (ticks * 0.6).toFixed(0);
+      return `  [${i}] ${f} (${ticks} ticks, ~${secs}s)`;
+    }).join('\n') + '\n\nType `replay [number]` for real-time playback.';
   }
 });
 
-commands.register('replay', { help: 'View a session recording: replay [number]', category: 'General',
+// Active replays: ws → interval
+const activeReplays = new Map();
+
+commands.register('replay', { help: 'Real-time session playback: replay [number]', category: 'General',
   fn: (p, args) => {
     if (!fs.existsSync(LOGS_DIR)) return 'No recordings yet.';
-    const files = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith('.log')).sort().reverse();
+    const files = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith('.jsonl')).sort().reverse();
     const idx = parseInt(args[0]);
     if (isNaN(idx) || idx < 0 || idx >= files.length) return `Usage: replay [0-${files.length - 1}]`;
-    const content = fs.readFileSync(path.join(LOGS_DIR, files[idx]), 'utf8');
-    return `── Replay: ${files[idx]} ──\n\n${content}`;
+
+    // Find this player's ws
+    let playerWs = null;
+    for (const [ws, pl] of players) { if (pl === p) { playerWs = ws; break; } }
+    if (!playerWs) return 'Error finding connection.';
+
+    // Stop any active replay
+    if (activeReplays.has(playerWs)) {
+      clearInterval(activeReplays.get(playerWs));
+      activeReplays.delete(playerWs);
+    }
+
+    // Parse recording
+    const lines = fs.readFileSync(path.join(LOGS_DIR, files[idx]), 'utf8').trim().split('\n');
+    const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    if (!entries.length) return 'Empty recording.';
+
+    const lastTick = entries[entries.length - 1].tick;
+    sendText(playerWs, `── Replay: ${files[idx]} ── (${lastTick} ticks, ~${(lastTick * 0.6).toFixed(0)}s)\n`);
+
+    // Play back at tick speed
+    let replayTick = 0;
+    let entryIdx = 0;
+    const interval = setInterval(() => {
+      // Emit all entries for this tick
+      while (entryIdx < entries.length && entries[entryIdx].tick <= replayTick) {
+        const e = entries[entryIdx];
+        if (e.type === 'in') {
+          sendText(playerWs, `[tick ${e.tick}] > ${e.text}`);
+        } else if (e.type === 'out') {
+          sendText(playerWs, `[tick ${e.tick}]   ${e.text}`);
+        } else if (e.type === 'end') {
+          sendText(playerWs, `\n── Replay complete ──`);
+          clearInterval(interval);
+          activeReplays.delete(playerWs);
+          return;
+        }
+        entryIdx++;
+      }
+      replayTick++;
+      if (entryIdx >= entries.length) {
+        sendText(playerWs, `\n── Replay complete ──`);
+        clearInterval(interval);
+        activeReplays.delete(playerWs);
+      }
+    }, 600); // One tick = 600ms
+
+    activeReplays.set(playerWs, interval);
+    return ''; // Initial message already sent
+  }
+});
+
+commands.register('stopreplay', { help: 'Stop active replay', category: 'General',
+  fn: (p) => {
+    for (const [ws, pl] of players) {
+      if (pl === p && activeReplays.has(ws)) {
+        clearInterval(activeReplays.get(ws));
+        activeReplays.delete(ws);
+        return 'Replay stopped.';
+      }
+    }
+    return 'No replay active.';
   }
 });
 
