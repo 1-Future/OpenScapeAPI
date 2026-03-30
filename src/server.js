@@ -33,12 +33,49 @@ const playersByName = new Map(); // name → player
 const groundItems = []; // [{ id, name, x, y, layer, count, owner, despawnTick }]
 let nextItemId = 1;
 
+// ── Session Logger ────────────────────────────────────────────────────────────
+const fs = require('fs');
+const path = require('path');
+const LOGS_DIR = path.join(__dirname, '..', 'data', 'logs');
+const sessionLogs = new Map(); // ws → { file, stream }
+
+function startSessionLog(ws, playerName) {
+  fs.mkdirSync(LOGS_DIR, { recursive: true });
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `${playerName}_${ts}.log`;
+  const filepath = path.join(LOGS_DIR, filename);
+  const stream = fs.createWriteStream(filepath, { flags: 'a' });
+  stream.write(`=== Session: ${playerName} | ${new Date().toISOString()} ===\n\n`);
+  sessionLogs.set(ws, { file: filename, stream });
+  console.log(`[log] Recording session → ${filename}`);
+}
+
+function logEntry(ws, type, text) {
+  const session = sessionLogs.get(ws);
+  if (!session) return;
+  const elapsed = ((Date.now() % 86400000) / 1000).toFixed(1);
+  const prefix = type === 'in' ? '> ' : '  ';
+  session.stream.write(`[${elapsed}s] ${prefix}${text}\n`);
+  if (type === 'out') session.stream.write('\n');
+}
+
+function endSessionLog(ws) {
+  const session = sessionLogs.get(ws);
+  if (!session) return;
+  session.stream.write(`\n=== Session ended: ${new Date().toISOString()} ===\n`);
+  session.stream.end();
+  sessionLogs.delete(ws);
+}
+
 // ── Helper ────────────────────────────────────────────────────────────────────
 function send(ws, msg) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-function sendText(ws, text) { send(ws, { t: 'msg', text }); }
+function sendText(ws, text) {
+  send(ws, { t: 'msg', text });
+  logEntry(ws, 'out', text);
+}
 
 function broadcast(msg) {
   for (const [ws] of players) send(ws, msg);
@@ -733,6 +770,26 @@ commands.register('admin', { help: 'Toggle admin mode', category: 'Build',
   fn: (p) => { p.admin = !p.admin; return `Admin: ${p.admin ? 'ON' : 'OFF'}`; }
 });
 
+commands.register('replays', { help: 'List session recordings', category: 'General',
+  fn: () => {
+    if (!fs.existsSync(LOGS_DIR)) return 'No recordings yet.';
+    const files = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith('.log')).sort().reverse();
+    if (!files.length) return 'No recordings yet.';
+    return 'Session recordings:\n' + files.map((f, i) => `  [${i}] ${f}`).join('\n') + '\n\nType `replay [number]` to view.';
+  }
+});
+
+commands.register('replay', { help: 'View a session recording: replay [number]', category: 'General',
+  fn: (p, args) => {
+    if (!fs.existsSync(LOGS_DIR)) return 'No recordings yet.';
+    const files = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith('.log')).sort().reverse();
+    const idx = parseInt(args[0]);
+    if (isNaN(idx) || idx < 0 || idx >= files.length) return `Usage: replay [0-${files.length - 1}]`;
+    const content = fs.readFileSync(path.join(LOGS_DIR, files[idx]), 'utf8');
+    return `── Replay: ${files[idx]} ──\n\n${content}`;
+  }
+});
+
 commands.register('save', { help: 'Save world', category: 'Build', admin: true,
   fn: () => { persistence.saveAll(); return 'World saved.'; }
 });
@@ -830,6 +887,8 @@ wss.on('connection', (ws) => {
       players.set(ws, p);
       playersByName.set(name.toLowerCase(), p);
       console.log(`[join] ${name} connected`);
+      startSessionLog(ws, name);
+      logEntry(ws, 'in', `login ${name}`);
       sendText(ws, `Logged in as ${name}. Combat level: ${combatLevel(p)}. Type \`help\` for commands.\nYou are at (${p.x}, ${p.y}).`);
       sendText(ws, commands.execute(p, 'look'));
       events.emit('player_login', { player: p, ws });
@@ -837,6 +896,7 @@ wss.on('connection', (ws) => {
     }
 
     // Execute command
+    logEntry(ws, 'in', input);
     const result = commands.execute(p, input);
     if (result) sendText(ws, result);
   });
@@ -844,6 +904,7 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const p = players.get(ws);
     if (p) {
+      endSessionLog(ws);
       // Save player
       const saveData = { ...p };
       delete saveData.path;
