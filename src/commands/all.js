@@ -11,10 +11,33 @@ const slayer = require('../data/slayer');
 
 module.exports = function registerAll(ctx) {
   const { players, playersByName, groundItems, tick, events, persistence,
-    tiles, walls, npcs, objects, pathfinding, combat,
+    tiles, walls, npcs, objects, pathfinding, combat, actions,
     getLevel, getXp, addXp, totalLevel, combatLevel,
+    getBoostedLevel, calcWeight,
     invAdd, invRemove, invCount, invFreeSlots,
     send, sendText, broadcast, findPlayer, nextItemId } = ctx;
+
+  // Helper: recalculate player weight
+  function updateWeight(p) {
+    if (calcWeight) calcWeight(p, (id) => items.get(id));
+  }
+
+  // ── Agility course definition ────────────────────────────────────────────
+  const AGILITY_COURSES = {
+    town_rooftop: {
+      name: 'Town Rooftop Course',
+      levelReq: 1,
+      obstacles: [
+        { name: 'Low wall', defId: 'agility_wall', x: 95, y: 80, xp: 8 },
+        { name: 'Rooftop edge', defId: 'agility_rooftop', x: 95, y: 82, xp: 8 },
+        { name: 'Gap', defId: 'agility_gap', x: 98, y: 80, xp: 10 },
+        { name: 'Obstacle net', defId: 'agility_net', x: 101, y: 80, xp: 10 },
+        { name: 'Balancing log', defId: 'agility_log', x: 104, y: 80, xp: 12 },
+        { name: 'Ladder', defId: 'agility_ladder', x: 107, y: 80, xp: 12 },
+      ],
+      lapBonus: 30,
+    },
+  };
 
   // ── Eating food ─────────────────────────────────────────────────────────────
   commands.register('eat', { help: 'Eat food to heal: eat [item]', category: 'Items',
@@ -50,68 +73,80 @@ module.exports = function registerAll(ctx) {
     }
   });
 
-  // ── Cooking ─────────────────────────────────────────────────────────────────
+  // ── Generic tick-based recipe processing ──────────────────────────────────
+  function startRecipeAction(p, recipe, skill, verb, extraCheck) {
+    if (getLevel(p, skill) < recipe.level) return `You need ${skill.charAt(0).toUpperCase() + skill.slice(1)} level ${recipe.level}.`;
+    if (extraCheck) { const err = extraCheck(); if (err) return err; }
+    for (const input of recipe.inputs) {
+      if (invCount(p, input.id) < input.count) return `You need ${input.count}x ${items.get(input.id)?.name || 'item'}.`;
+    }
+    if (p.busy) actions.cancel(p);
+    actions.start(p, {
+      type: skill,
+      ticks: recipe.ticks || 4,
+      repeat: true,
+      data: { recipe, player: p, skill, verb },
+      onTick: (data, ticksLeft) => ticksLeft === (data.recipe.ticks || 4) - 1 ? `You begin to ${data.verb} ${data.recipe.name}...` : null,
+      onComplete: (data) => {
+        const r = data.recipe;
+        const pl = data.player;
+        // Check materials still available
+        for (const input of r.inputs) { if (invCount(pl, input.id) < input.count) { actions.cancel(pl); return 'You run out of materials.'; } }
+        // Fail chance (smelting iron)
+        if (r.failChance && Math.random() < r.failChance) {
+          for (const input of r.inputs) invRemove(pl, input.id, input.count);
+          updateWeight(pl);
+          return `You fail to ${data.verb} ${r.name}.`;
+        }
+        // Burn check (cooking)
+        if (r.stopBurn) {
+          const burnChance = Math.max(0, (r.stopBurn - getLevel(pl, data.skill)) / r.stopBurn);
+          if (Math.random() < burnChance) {
+            for (const input of r.inputs) invRemove(pl, input.id, input.count);
+            if (r.failItem) invAdd(pl, r.failItem, items.get(r.failItem)?.name || 'Burnt food', 1);
+            updateWeight(pl);
+            return `You accidentally burn the ${r.name}.`;
+          }
+        }
+        for (const input of r.inputs) invRemove(pl, input.id, input.count);
+        for (const output of r.outputs) invAdd(pl, output.id, items.get(output.id)?.name || r.name, output.count, items.get(output.id)?.stackable);
+        const lvl = addXp(pl, data.skill, r.xp);
+        updateWeight(pl);
+        let msg = `You ${data.verb} ${r.name}. +${r.xp} ${data.skill.charAt(0).toUpperCase() + data.skill.slice(1)} XP.`;
+        if (lvl) msg += ` ${data.skill.charAt(0).toUpperCase() + data.skill.slice(1)} level: ${lvl}!`;
+        // Can we repeat?
+        for (const input of r.inputs) { if (invCount(pl, input.id) < input.count) { actions.cancel(pl); msg += ' You run out of materials.'; } }
+        return msg;
+      },
+    });
+    return `You begin to ${verb} ${recipe.name}...`;
+  }
+
+  // ── Cooking (tick-based) ─────────────────────────────────────────────────────
   commands.register('cook', { help: 'Cook food: cook [item]', category: 'Skills',
     fn: (p, args) => {
       const name = args.join(' ').toLowerCase();
       if (!name) {
         const available = recipes.forSkill('cooking').filter(r => getLevel(p, 'cooking') >= r.level);
-        return 'Cooking recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP)`).join('\n');
+        return 'Cooking recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP, ${r.ticks}t)`).join('\n');
       }
       const recipe = recipes.forSkill('cooking').find(r => r.name.toLowerCase() === name || r.outputs[0]?.id === items.find(name)?.id);
       if (!recipe) return `Unknown recipe: ${name}. Type \`cook\` to see recipes.`;
-      if (getLevel(p, 'cooking') < recipe.level) return `You need Cooking level ${recipe.level}.`;
-      // Check inputs
-      for (const input of recipe.inputs) {
-        if (invCount(p, input.id) < input.count) {
-          const itemDef = items.get(input.id);
-          return `You need ${input.count}x ${itemDef ? itemDef.name : 'item'}.`;
-        }
-      }
-      // Remove inputs
-      for (const input of recipe.inputs) invRemove(p, input.id, input.count);
-      // Burn check: linear interpolation from level to stopBurn
-      const burnChance = recipe.stopBurn ? Math.max(0, (recipe.stopBurn - getLevel(p, 'cooking')) / recipe.stopBurn) : 0;
-      if (Math.random() < burnChance) {
-        if (recipe.failItem) invAdd(p, recipe.failItem, items.get(recipe.failItem)?.name || 'Burnt food', 1);
-        return `You accidentally burn the ${recipe.name}.`;
-      }
-      // Success
-      for (const output of recipe.outputs) {
-        invAdd(p, output.id, items.get(output.id)?.name || recipe.name, output.count, items.get(output.id)?.stackable);
-      }
-      const lvl = addXp(p, 'cooking', recipe.xp);
-      let msg = `You cook ${recipe.name}. +${recipe.xp} Cooking XP.`;
-      if (lvl) msg += ` Cooking level: ${lvl}!`;
-      return msg;
+      return startRecipeAction(p, recipe, 'cooking', 'cook');
     }
   });
 
-  // ── Smithing (smelt + smith) ────────────────────────────────────────────────
+  // ── Smithing (tick-based) ────────────────────────────────────────────────────
   commands.register('smelt', { help: 'Smelt ore into bars: smelt [bar]', category: 'Skills',
     fn: (p, args) => {
       const name = args.join(' ').toLowerCase();
       if (!name) {
         const available = recipes.forSkill('smithing').filter(r => r.station === 'furnace' && getLevel(p, 'smithing') >= r.level);
-        return 'Smelting recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP)`).join('\n');
+        return 'Smelting recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP, ${r.ticks}t)`).join('\n');
       }
       const recipe = recipes.forSkill('smithing').find(r => r.station === 'furnace' && r.name.toLowerCase().includes(name));
       if (!recipe) return `Unknown smelting recipe: ${name}. Type \`smelt\` to see recipes.`;
-      if (getLevel(p, 'smithing') < recipe.level) return `You need Smithing level ${recipe.level}.`;
-      for (const input of recipe.inputs) {
-        if (invCount(p, input.id) < input.count) return `You need ${input.count}x ${items.get(input.id)?.name || 'item'}.`;
-      }
-      // Fail chance (iron bar = 50%)
-      if (recipe.failChance && Math.random() < recipe.failChance) {
-        for (const input of recipe.inputs) invRemove(p, input.id, input.count);
-        return `The ore is too impure. You fail to smelt a bar.`;
-      }
-      for (const input of recipe.inputs) invRemove(p, input.id, input.count);
-      for (const output of recipe.outputs) invAdd(p, output.id, items.get(output.id)?.name || recipe.name, output.count, items.get(output.id)?.stackable);
-      const lvl = addXp(p, 'smithing', recipe.xp);
-      let msg = `You smelt a ${recipe.name}. +${recipe.xp} Smithing XP.`;
-      if (lvl) msg += ` Smithing level: ${lvl}!`;
-      return msg;
+      return startRecipeAction(p, recipe, 'smithing', 'smelt');
     }
   });
 
@@ -120,84 +155,49 @@ module.exports = function registerAll(ctx) {
       const name = args.join(' ').toLowerCase();
       if (!name) {
         const available = recipes.forSkill('smithing').filter(r => r.station === 'anvil' && getLevel(p, 'smithing') >= r.level);
-        return 'Smithing recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP)`).join('\n');
+        return 'Smithing recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP, ${r.ticks}t)`).join('\n');
       }
       const recipe = recipes.forSkill('smithing').find(r => r.station === 'anvil' && r.name.toLowerCase().includes(name));
       if (!recipe) return `Unknown smithing recipe: ${name}. Type \`smith\` to see recipes.`;
-      if (getLevel(p, 'smithing') < recipe.level) return `You need Smithing level ${recipe.level}.`;
-      if (!invCount(p, 570)) return 'You need a hammer.';
-      for (const input of recipe.inputs) {
-        if (invCount(p, input.id) < input.count) return `You need ${input.count}x ${items.get(input.id)?.name || 'item'}.`;
-      }
-      for (const input of recipe.inputs) invRemove(p, input.id, input.count);
-      for (const output of recipe.outputs) invAdd(p, output.id, items.get(output.id)?.name || recipe.name, output.count);
-      const lvl = addXp(p, 'smithing', recipe.xp);
-      let msg = `You smith a ${recipe.name}. +${recipe.xp} Smithing XP.`;
-      if (lvl) msg += ` Smithing level: ${lvl}!`;
-      return msg;
+      return startRecipeAction(p, recipe, 'smithing', 'smith', () => !invCount(p, 570) ? 'You need a hammer.' : null);
     }
   });
 
-  // ── Crafting ────────────────────────────────────────────────────────────────
+  // ── Crafting (tick-based) ────────────────────────────────────────────────────
   commands.register('craft', { help: 'Craft items: craft [item]', category: 'Skills',
     fn: (p, args) => {
       const name = args.join(' ').toLowerCase();
       if (!name) {
         const available = recipes.forSkill('crafting').filter(r => getLevel(p, 'crafting') >= r.level);
-        return 'Crafting recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP)`).join('\n');
+        return 'Crafting recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP, ${r.ticks}t)`).join('\n');
       }
       const recipe = recipes.forSkill('crafting').find(r => r.name.toLowerCase().includes(name));
       if (!recipe) return `Unknown crafting recipe: ${name}. Type \`craft\` to see recipes.`;
-      if (getLevel(p, 'crafting') < recipe.level) return `You need Crafting level ${recipe.level}.`;
-      for (const input of recipe.inputs) {
-        if (invCount(p, input.id) < input.count) return `You need ${input.count}x ${items.get(input.id)?.name || 'item'}.`;
-      }
-      for (const input of recipe.inputs) invRemove(p, input.id, input.count);
-      for (const output of recipe.outputs) invAdd(p, output.id, items.get(output.id)?.name || recipe.name, output.count, items.get(output.id)?.stackable);
-      const lvl = addXp(p, 'crafting', recipe.xp);
-      let msg = `You craft ${recipe.name}. +${recipe.xp} Crafting XP.`;
-      if (lvl) msg += ` Crafting level: ${lvl}!`;
-      return msg;
+      return startRecipeAction(p, recipe, 'crafting', 'craft');
     }
   });
 
-  // ── Fletching ───────────────────────────────────────────────────────────────
+  // ── Fletching (tick-based) ──────────────────────────────────────────────────
   commands.register('fletch', { help: 'Fletch items: fletch [item]', category: 'Skills',
     fn: (p, args) => {
       const name = args.join(' ').toLowerCase();
       if (!name) {
         const available = recipes.forSkill('fletching').filter(r => getLevel(p, 'fletching') >= r.level);
-        return 'Fletching recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP)`).join('\n');
+        return 'Fletching recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP, ${r.ticks}t)`).join('\n');
       }
       const recipe = recipes.forSkill('fletching').find(r => r.name.toLowerCase().includes(name));
       if (!recipe) return `Unknown fletching recipe: ${name}. Type \`fletch\` to see recipes.`;
-      if (getLevel(p, 'fletching') < recipe.level) return `You need Fletching level ${recipe.level}.`;
-      for (const input of recipe.inputs) {
-        if (invCount(p, input.id) < input.count) return `You need ${input.count}x ${items.get(input.id)?.name || 'item'}.`;
-      }
-      for (const input of recipe.inputs) invRemove(p, input.id, input.count);
-      for (const output of recipe.outputs) invAdd(p, output.id, items.get(output.id)?.name || recipe.name, output.count, items.get(output.id)?.stackable);
-      const lvl = addXp(p, 'fletching', recipe.xp);
-      let msg = `You fletch ${recipe.name}. +${recipe.xp} Fletching XP.`;
-      if (lvl) msg += ` Fletching level: ${lvl}!`;
-      return msg;
+      return startRecipeAction(p, recipe, 'fletching', 'fletch');
     }
   });
 
-  // ── Herblore ────────────────────────────────────────────────────────────────
+  // ── Herblore (tick-based) ──────────────────────────────────────────────────
   commands.register('clean', { help: 'Clean a grimy herb: clean [herb]', category: 'Skills',
     fn: (p, args) => {
       const name = args.join(' ').toLowerCase();
       const recipe = recipes.forSkill('herblore').find(r => r.name.toLowerCase().includes(name) && r.id.startsWith('clean'));
       if (!recipe) return 'Usage: clean [herb name]. E.g., clean guam';
-      if (getLevel(p, 'herblore') < recipe.level) return `You need Herblore level ${recipe.level}.`;
-      if (invCount(p, recipe.inputs[0].id) < 1) return `You don't have any ${items.get(recipe.inputs[0].id)?.name || 'herbs'}.`;
-      invRemove(p, recipe.inputs[0].id, 1);
-      invAdd(p, recipe.outputs[0].id, items.get(recipe.outputs[0].id)?.name || recipe.name, 1);
-      const lvl = addXp(p, 'herblore', recipe.xp);
-      let msg = `You clean the herb. +${recipe.xp} Herblore XP.`;
-      if (lvl) msg += ` Herblore level: ${lvl}!`;
-      return msg;
+      return startRecipeAction(p, recipe, 'herblore', 'clean');
     }
   });
 
@@ -206,37 +206,21 @@ module.exports = function registerAll(ctx) {
       const name = args.join(' ').toLowerCase();
       if (!name) {
         const available = recipes.forSkill('herblore').filter(r => r.id.startsWith('mix') && getLevel(p, 'herblore') >= r.level);
-        return 'Potion recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP)`).join('\n');
+        return 'Potion recipes:\n' + available.map(r => `  ${r.name} (lvl ${r.level}, ${r.xp} XP, ${r.ticks}t)`).join('\n');
       }
       const recipe = recipes.forSkill('herblore').find(r => r.id.startsWith('mix') && r.name.toLowerCase().includes(name));
       if (!recipe) return `Unknown potion: ${name}. Type \`mix\` to see recipes.`;
-      if (getLevel(p, 'herblore') < recipe.level) return `You need Herblore level ${recipe.level}.`;
-      for (const input of recipe.inputs) {
-        if (invCount(p, input.id) < input.count) return `You need ${items.get(input.id)?.name || 'item'}.`;
-      }
-      for (const input of recipe.inputs) invRemove(p, input.id, input.count);
-      for (const output of recipe.outputs) invAdd(p, output.id, items.get(output.id)?.name || recipe.name, output.count);
-      const lvl = addXp(p, 'herblore', recipe.xp);
-      let msg = `You mix a ${recipe.name}. +${recipe.xp} Herblore XP.`;
-      if (lvl) msg += ` Herblore level: ${lvl}!`;
-      return msg;
+      return startRecipeAction(p, recipe, 'herblore', 'mix');
     }
   });
 
-  // ── Firemaking ──────────────────────────────────────────────────────────────
+  // ── Firemaking (tick-based) ─────────────────────────────────────────────────
   commands.register('light', { help: 'Light logs: light [logs]', aliases: ['burn'], category: 'Skills',
     fn: (p, args) => {
       const name = args.join(' ').toLowerCase() || 'logs';
       const recipe = recipes.forSkill('firemaking').find(r => r.name.toLowerCase().includes(name));
       if (!recipe) return `Unknown: ${name}. Type \`light\` with: logs, oak, willow, maple, yew, magic`;
-      if (getLevel(p, 'firemaking') < recipe.level) return `You need Firemaking level ${recipe.level}.`;
-      if (!invCount(p, 573)) return 'You need a tinderbox.';
-      if (invCount(p, recipe.inputs[0].id) < 1) return `You don't have any ${items.get(recipe.inputs[0].id)?.name}.`;
-      invRemove(p, recipe.inputs[0].id, 1);
-      const lvl = addXp(p, 'firemaking', recipe.xp);
-      let msg = `You light the ${items.get(recipe.inputs[0].id)?.name}. +${recipe.xp} Firemaking XP.`;
-      if (lvl) msg += ` Firemaking level: ${lvl}!`;
-      return msg;
+      return startRecipeAction(p, recipe, 'firemaking', 'light', () => !invCount(p, 573) ? 'You need a tinderbox.' : null);
     }
   });
 
@@ -630,6 +614,163 @@ module.exports = function registerAll(ctx) {
     fn: (p) => {
       p.x = 100; p.y = 100; p.layer = 0; p.path = [];
       return 'You teleport home to Spawn Island.';
+    }
+  });
+
+  // ── Agility ────────────────────────────────────────────────────────────────
+  commands.register('cross', { help: 'Cross an agility obstacle: cross [obstacle]', aliases: ['climb', 'jump', 'balance'], category: 'Skills',
+    fn: (p, args) => {
+      const name = args.join(' ').toLowerCase();
+      if (!name) return 'Usage: cross [obstacle]. Look around for agility obstacles.';
+
+      let foundCourse = null, foundObstacle = null, foundIdx = -1;
+      for (const [courseId, course] of Object.entries(AGILITY_COURSES)) {
+        for (let i = 0; i < course.obstacles.length; i++) {
+          const obs = course.obstacles[i];
+          if (obs.name.toLowerCase().includes(name)) {
+            const dist = Math.max(Math.abs(p.x - obs.x), Math.abs(p.y - obs.y));
+            if (dist <= 3) { foundCourse = { id: courseId, ...course }; foundObstacle = obs; foundIdx = i; break; }
+          }
+        }
+        if (foundObstacle) break;
+      }
+
+      if (!foundObstacle) return `No obstacle called "${name}" nearby.`;
+      if (getLevel(p, 'agility') < foundCourse.levelReq) return `You need Agility level ${foundCourse.levelReq}.`;
+      if (p.busy) actions.cancel(p);
+
+      actions.start(p, {
+        type: 'agility',
+        ticks: 3,
+        repeat: false,
+        data: { player: p, course: foundCourse, obstacle: foundObstacle, obstacleIdx: foundIdx },
+        onComplete: (data) => {
+          const pl = data.player;
+          const lvl = addXp(pl, 'agility', data.obstacle.xp);
+          if (!pl.agilityLap || pl.agilityLap.courseId !== data.course.id) {
+            pl.agilityLap = { courseId: data.course.id, obstaclesDone: new Set() };
+          }
+          pl.agilityLap.obstaclesDone.add(data.obstacleIdx);
+          let msg = `You cross the ${data.obstacle.name}. +${data.obstacle.xp} Agility XP.`;
+          if (lvl) msg += ` Agility level: ${lvl}!`;
+          if (pl.agilityLap.obstaclesDone.size >= data.course.obstacles.length) {
+            const lapLvl = addXp(pl, 'agility', data.course.lapBonus);
+            msg += `\nLap complete! +${data.course.lapBonus} bonus Agility XP.`;
+            if (lapLvl) msg += ` Agility level: ${lapLvl}!`;
+            pl.agilityLap = null;
+          } else {
+            msg += ` (${pl.agilityLap.obstaclesDone.size}/${data.course.obstacles.length} obstacles)`;
+          }
+          return msg;
+        },
+      });
+      return `You attempt to cross the ${foundObstacle.name}...`;
+    }
+  });
+
+  // ── Thieving ───────────────────────────────────────────────────────────────
+  commands.register('pickpocket', { help: 'Pickpocket an NPC: pickpocket [npc]', aliases: ['steal'], category: 'Skills',
+    fn: (p, args) => {
+      const name = args.join(' ');
+      if (!name) return 'Usage: pickpocket [npc name]';
+      if (p.stunTicks > 0) return `You are stunned! (${p.stunTicks} ticks remaining)`;
+
+      const npc = npcs.findNpcByName(name, p.x, p.y, 2, p.layer);
+      if (!npc) return `No "${name}" nearby.`;
+
+      const npcDef = npcs.npcDefs.get(npc.defId);
+      if (!npcDef || !npcDef.thieving) return `You can't pickpocket the ${npc.name}.`;
+
+      const thieving = npcDef.thieving;
+      if (getLevel(p, 'thieving') < thieving.level) return `You need Thieving level ${thieving.level}.`;
+
+      const levelDiff = getLevel(p, 'thieving') - thieving.level;
+      const successChance = Math.min(0.95, 0.5 + levelDiff * 0.02);
+
+      if (Math.random() < successChance) {
+        const loot = thieving.loot[Math.floor(Math.random() * thieving.loot.length)];
+        const count = loot.min + Math.floor(Math.random() * (loot.max - loot.min + 1));
+        const itemDef = items.get(loot.id);
+        invAdd(p, loot.id, loot.name, count, itemDef?.stackable);
+        const lvl = addXp(p, 'thieving', thieving.xp);
+        updateWeight(p);
+        let msg = `You pick the ${npc.name}'s pocket. Got: ${loot.name} x${count}. +${thieving.xp} Thieving XP.`;
+        if (lvl) msg += ` Thieving level: ${lvl}!`;
+        return msg;
+      } else {
+        const dmg = 1 + Math.floor(Math.random() * (thieving.stunDamage || 2));
+        p.hp = Math.max(0, p.hp - dmg);
+        p.stunTicks = 4;
+        let msg = `You fail to pickpocket the ${npc.name}! They hit you for ${dmg}. HP: ${p.hp}/${p.maxHp}. Stunned for 4 ticks!`;
+        if (p.hp <= 0) {
+          msg += '\nOh dear, you are dead!';
+          p.hp = p.maxHp; p.x = 100; p.y = 100; p.layer = 0; p.path = []; p.stunTicks = 0;
+        }
+        return msg;
+      }
+    }
+  });
+
+  // ── Potion Drinking ────────────────────────────────────────────────────────
+  commands.register('drink', { help: 'Drink a potion: drink [potion]', category: 'Items',
+    fn: (p, args) => {
+      const name = args.join(' ').toLowerCase();
+      if (!name) return 'Usage: drink [potion name]';
+      const slot = p.inventory.findIndex(s => s && s.name.toLowerCase().includes(name));
+      if (slot < 0) return `You don't have "${name}".`;
+      const item = p.inventory[slot];
+      const def = items.get(item.id);
+      if (!def || def.category !== 'potion') return `You can't drink ${item.name}.`;
+
+      p.inventory[slot] = item.count > 1 ? { ...item, count: item.count - 1 } : null;
+      if (!p.boosts) p.boosts = {};
+      const potionName = item.name.toLowerCase();
+      let msg = `You drink the ${item.name}.`;
+
+      if (potionName.includes('super attack')) {
+        const boost = 5 + Math.floor(getLevel(p, 'attack') * 0.15);
+        p.boosts.attack = { amount: boost, ticksLeft: 90 };
+        msg += ` Attack boosted by +${boost} for 90 ticks.`;
+      } else if (potionName.includes('super strength')) {
+        const boost = 5 + Math.floor(getLevel(p, 'strength') * 0.15);
+        p.boosts.strength = { amount: boost, ticksLeft: 90 };
+        msg += ` Strength boosted by +${boost} for 90 ticks.`;
+      } else if (potionName.includes('attack')) {
+        const boost = 3 + Math.floor(getLevel(p, 'attack') * 0.1);
+        p.boosts.attack = { amount: boost, ticksLeft: 90 };
+        msg += ` Attack boosted by +${boost} for 90 ticks.`;
+      } else if (potionName.includes('strength')) {
+        const boost = 3 + Math.floor(getLevel(p, 'strength') * 0.1);
+        p.boosts.strength = { amount: boost, ticksLeft: 90 };
+        msg += ` Strength boosted by +${boost} for 90 ticks.`;
+      } else if (potionName.includes('defence')) {
+        const boost = 3 + Math.floor(getLevel(p, 'defence') * 0.1);
+        p.boosts.defence = { amount: boost, ticksLeft: 90 };
+        msg += ` Defence boosted by +${boost} for 90 ticks.`;
+      } else if (potionName.includes('prayer')) {
+        const restore = Math.floor(7 + getLevel(p, 'prayer') / 4);
+        p.prayerPoints = Math.min(getLevel(p, 'prayer'), p.prayerPoints + restore);
+        msg += ` Prayer restored by ${restore}. Prayer: ${p.prayerPoints}/${getLevel(p, 'prayer')}.`;
+      } else if (potionName.includes('restore')) {
+        if (p.boosts) for (const [sk, b] of Object.entries(p.boosts)) { if (b.amount < 0) delete p.boosts[sk]; }
+        msg += ' Your stats have been restored.';
+      } else if (potionName.includes('antipoison')) {
+        msg += ' You have been cured of poison.';
+      } else {
+        msg += ' Nothing interesting happens.';
+      }
+
+      invAdd(p, 325, 'Vial', 1);
+      updateWeight(p);
+      return msg;
+    }
+  });
+
+  // ── Weight ─────────────────────────────────────────────────────────────────
+  commands.register('weight', { help: 'Show your carry weight', category: 'General',
+    fn: (p) => {
+      updateWeight(p);
+      return `Weight: ${p.weight.toFixed(1)} kg`;
     }
   });
 };

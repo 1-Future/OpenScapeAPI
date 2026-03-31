@@ -66,4 +66,22 @@ function heuristic(x1, y1, x2, y2) {
   return Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
 }
 
-module.exports = { findPath, MAX_PATH };
+// Find path to a tile adjacent to (tx, ty) rather than to (tx, ty) itself
+function findAdjacentPath(sx, sy, tx, ty, layer = 0) {
+  if (Math.abs(sx - tx) <= 1 && Math.abs(sy - ty) <= 1) return []; // Already adjacent
+  const dirs = [
+    { dx: 0, dy: -1 }, { dx: 0, dy: 1 }, { dx: -1, dy: 0 }, { dx: 1, dy: 0 },
+    { dx: -1, dy: -1 }, { dx: 1, dy: -1 }, { dx: -1, dy: 1 }, { dx: 1, dy: 1 },
+  ];
+  let best = null;
+  for (const { dx, dy } of dirs) {
+    const ax = tx + dx, ay = ty + dy;
+    if (!tiles.isWalkable(ax, ay, layer)) continue;
+    if (ax === sx && ay === sy) return []; // Already adjacent
+    const path = findPath(sx, sy, ax, ay, layer);
+    if (path && (!best || path.length < best.length)) best = path;
+  }
+  return best;
+}
+
+module.exports = { findPath, findAdjacentPath, MAX_PATH };

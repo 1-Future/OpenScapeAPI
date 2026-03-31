@@ -20,6 +20,7 @@ const objects = require('./world/objects');
 
 // Player
 const { createPlayer, combatLevel, getLevel, getXp, addXp, totalLevel,
+  getBoostedLevel, calcWeight,
   invAdd, invRemove, invCount, invFreeSlots, SKILLS, EQUIP_SLOTS,
   SPAWN_X, SPAWN_Y, INV_SIZE, xpForLevel, levelForXp } = require('./player/player');
 
@@ -122,6 +123,32 @@ function movementTick(currentTick) {
 
     if (actions.isActive(p)) actions.cancel(p);
     events.emit('player_move', { player: p, ws });
+
+    // Check wilderness entry
+    if (p.y <= 55) {
+      const wildyLevel = 55 - p.y;
+      const wasInWildy = (p._lastWildyCheck || false);
+      if (!wasInWildy) {
+        sendText(ws, `Warning: You are entering the Wilderness! (Level ${wildyLevel}) PvP is enabled here.`);
+      }
+      p._lastWildyCheck = true;
+    } else {
+      p._lastWildyCheck = false;
+    }
+
+    // If path is now empty and we have a pending gather, start it
+    if (p.path.length === 0 && p._pendingGather) {
+      const pg = p._pendingGather;
+      delete p._pendingGather;
+      const obj = objects.objects.get(pg.objKey);
+      if (obj && !obj.depleted) {
+        const dist = Math.max(Math.abs(p.x - obj.x), Math.abs(p.y - obj.y));
+        if (dist <= 1) {
+          const result = startGathering(p, ws, pg.skill, pg.verb, obj);
+          if (result) sendText(ws, result);
+        }
+      }
+    }
   }
 
   // Regen run energy for stationary players
@@ -136,6 +163,46 @@ function movementTick(currentTick) {
 
 // ── Combat Tick ───────────────────────────────────────────────────────────────
 function combatTick(currentTick) {
+  // PvP combat
+  for (const [ws, p] of players) {
+    if (!p.pvpTarget) continue;
+    // Find target player
+    let targetWs = null, target = null;
+    for (const [tw, tp] of players) {
+      if (tp.id === p.pvpTarget) { targetWs = tw; target = tp; break; }
+    }
+    if (!target || !target.connected) { p.pvpTarget = null; p.busy = false; continue; }
+    const dist = Math.max(Math.abs(p.x - target.x), Math.abs(p.y - target.y));
+    if (dist > 1) {
+      const adjPath = pathfinding.findAdjacentPath(p.x, p.y, target.x, target.y, p.layer);
+      if (adjPath && adjPath.length > 0) p.path = adjPath;
+      continue;
+    }
+    if (currentTick < p.nextAttackTick) continue;
+    p.nextAttackTick = currentTick + combat.getAttackSpeed(p);
+    const result = combat.meleeAttack(p, target);
+    target.hp = Math.max(0, target.hp - result.damage);
+    let msg = result.hit ? `You hit ${target.name} for ${result.damage} damage.` : `You miss ${target.name}.`;
+    combat.combatXp(p, result.damage);
+    sendText(ws, msg);
+    if (result.damage > 0) sendText(targetWs, `${p.name} hits you for ${result.damage}. HP: ${target.hp}/${target.maxHp}`);
+    if (target.hp <= 0) {
+      p.pvpTarget = null; p.busy = false;
+      sendText(ws, `You have defeated ${target.name}!`);
+      // Target dies — same death mechanics
+      sendText(targetWs, `Oh dear, you are dead! Killed by ${p.name}.`);
+      target.hp = target.maxHp; target.x = SPAWN_X; target.y = SPAWN_Y; target.layer = 0;
+      target.combatTarget = null; target.pvpTarget = null; target.busy = false; target.path = [];
+      target.prayerPoints = getLevel(target, 'prayer'); target.activePrayers.clear(); target.runEnergy = 10000;
+    }
+    // Auto retaliate
+    if (target.hp > 0 && target.autoRetaliate && !target.pvpTarget && !target.combatTarget) {
+      target.pvpTarget = p.id; target.busy = true;
+      if (!target.skull) target.skull = 0; // Don't skull on retaliation
+    }
+  }
+
+  // NPC combat
   for (const [ws, p] of players) {
     if (!p.combatTarget) continue;
     const npc = npcs.getNpc(p.combatTarget);
@@ -286,6 +353,37 @@ function worldTick(currentTick) {
       if (p.hp < p.maxHp && !p.combatTarget) {
         p.hp = Math.min(p.maxHp, p.hp + 1);
       }
+    }
+  }
+
+  // Stun tick decay
+  for (const [ws, p] of players) {
+    if (p.stunTicks > 0) {
+      p.stunTicks--;
+      if (p.stunTicks === 0) sendText(ws, 'You are no longer stunned.');
+    }
+  }
+
+  // Potion boost decay (every tick)
+  for (const [ws, p] of players) {
+    if (p.boosts) {
+      for (const [skill, boost] of Object.entries(p.boosts)) {
+        if (boost.ticksLeft > 0) {
+          boost.ticksLeft--;
+          if (boost.ticksLeft <= 0) {
+            delete p.boosts[skill];
+            sendText(ws, `Your ${skill} boost has worn off.`);
+          }
+        }
+      }
+    }
+  }
+
+  // Skull decay
+  for (const [ws, p] of players) {
+    if (p.skull > 0) {
+      p.skull--;
+      if (p.skull === 0) sendText(ws, 'Your skull has faded.');
     }
   }
 
@@ -470,21 +568,50 @@ commands.register('close', { help: 'Close a door: close [n/e/s/w]', category: 'N
 });
 
 // Combat
-commands.register('attack', { help: 'Attack an NPC: attack [name]', aliases: ['fight', 'kill'], category: 'Combat',
+commands.register('attack', { help: 'Attack an NPC or player: attack [name]', aliases: ['fight', 'kill'], category: 'Combat',
   fn: (p, args) => {
     const name = args.join(' ');
     if (!name) return 'Usage: attack [npc name]';
+
+    // Check for PvP: try to find a player first if in wilderness
+    const area = tiles.getArea(p.x, p.y, p.layer);
+    if (area && area.pvp) {
+      const target = findPlayer(name);
+      if (target && target !== p && Math.abs(target.x - p.x) <= 15 && Math.abs(target.y - p.y) <= 15) {
+        // PvP attack
+        const dist = Math.max(Math.abs(p.x - target.x), Math.abs(p.y - target.y));
+        if (dist > 1) {
+          const adjPath = pathfinding.findAdjacentPath(p.x, p.y, target.x, target.y, p.layer);
+          if (!adjPath) return `Can't reach ${target.name}.`;
+          if (adjPath.length > 0) p.path = adjPath;
+        }
+        p.combatTarget = null;
+        p.pvpTarget = target.id;
+        p.busy = true;
+        if (!p.skull) p.skull = 3000; // Skull for 30 minutes
+        return `Attacking ${target.name} (combat ${combatLevel(target)})! You are now skulled.`;
+      }
+    }
+
     const npc = npcs.findNpcByName(name, p.x, p.y, 15, p.layer);
     if (!npc) return `No "${name}" nearby.`;
     if (npc.combat === 0) return `You can't attack the ${npc.name}.`;
+    // Auto-walk to adjacent tile if not adjacent
+    const dist = Math.max(Math.abs(p.x - npc.x), Math.abs(p.y - npc.y));
+    if (dist > 1) {
+      const adjPath = pathfinding.findAdjacentPath(p.x, p.y, npc.x, npc.y, p.layer);
+      if (!adjPath) return `Can't reach the ${npc.name}.`;
+      if (adjPath.length > 0) p.path = adjPath;
+    }
     p.combatTarget = npc.id;
+    p.pvpTarget = null;
     p.busy = true;
     return `Attacking ${npc.name} (lvl ${npc.combat}, HP ${npc.hp}/${npc.maxHp}).`;
   }
 });
 
-commands.register('flee', { help: 'Stop fighting', aliases: ['retreat', 'stop'], category: 'Combat',
-  fn: (p) => { p.combatTarget = null; p.busy = false; p.path = []; return 'You stop fighting.'; }
+commands.register('flee', { help: 'Stop fighting', aliases: ['retreat'], category: 'Combat',
+  fn: (p) => { p.combatTarget = null; p.pvpTarget = null; p.busy = false; p.path = []; return 'You stop fighting.'; }
 });
 
 commands.register('style', { help: 'Set attack style: style [accurate/aggressive/defensive/controlled]', category: 'Combat',
@@ -571,6 +698,7 @@ commands.register('pickup', { help: 'Pick up an item: pickup [name]', aliases: [
     if (invFreeSlots(p) < 1) return 'Inventory is full.';
     const item = groundItems.splice(idx, 1)[0];
     invAdd(p, item.id, item.name, item.count);
+    calcWeight(p, (id) => items.get(id));
     return `Picked up: ${item.name} x${item.count}`;
   }
 });
@@ -583,6 +711,7 @@ commands.register('drop', { help: 'Drop an item: drop [name]', category: 'Items'
     const item = p.inventory[slot];
     p.inventory[slot] = null;
     groundItems.push({ id: nextItemId++, name: item.name, count: item.count, x: p.x, y: p.y, layer: p.layer, owner: p.id, despawnTick: tick.getTick() + 200 });
+    calcWeight(p, (id) => items.get(id));
     return `Dropped: ${item.name} x${item.count}`;
   }
 });
@@ -608,7 +737,8 @@ commands.register('equip', { help: 'Equip an item: equip [name]', aliases: ['wea
     p.inventory[slot] = item.count > 1 ? { ...item, count: item.count - 1 } : null;
     const old = p.equipment[equipSlot];
     p.equipment[equipSlot] = equipItem;
-    if (old) { invAdd(p, old.id, old.name, 1); return `Equipped ${item.name} (replaced ${old.name}).`; }
+    calcWeight(p, (id) => items.get(id));
+    if (old) { invAdd(p, old.id, old.name, 1); calcWeight(p, (id) => items.get(id)); return `Equipped ${item.name} (replaced ${old.name}).`; }
     return `Equipped ${item.name}.`;
   }
 });
@@ -621,6 +751,7 @@ commands.register('unequip', { help: 'Unequip a slot: unequip [slot]', aliases: 
     const item = p.equipment[slot];
     delete p.equipment[slot];
     invAdd(p, item.id, item.name, 1);
+    calcWeight(p, (id) => items.get(id));
     return `Unequipped ${item.name}.`;
   }
 });
@@ -711,44 +842,48 @@ function startGathering(p, ws, skillName, verb, obj) {
   return `You begin to ${verb} the ${obj.name}...`;
 }
 
-commands.register('chop', { help: 'Chop a tree (repeating)', category: 'Gathering',
-  fn: (p, args) => {
-    const name = args.join(' ') || 'tree';
-    const obj = objects.findObjectByName(name, p.x, p.y, 3, p.layer);
-    if (!obj) return `No "${name}" nearby.`;
-    if (obj.skill !== 'woodcutting') return `You can't chop the ${obj.name}.`;
-    let ws; for (const [w, pl] of players) { if (pl === p) { ws = w; break; } }
-    return startGathering(p, ws, 'woodcutting', 'chop', obj);
+// Helper: find object within 15 tiles, auto-walk if not adjacent, then start gathering
+function gatherWithWalk(p, name, skill, verb, defaultName) {
+  const targetName = name || defaultName;
+  const obj = objects.findObjectByName(targetName, p.x, p.y, 15, p.layer);
+  if (!obj) return `No "${targetName}" nearby.`;
+  if (obj.skill !== skill) return `You can't ${verb} the ${obj.name}.`;
+  let ws; for (const [w, pl] of players) { if (pl === p) { ws = w; break; } }
+  // Check if adjacent (Chebyshev distance <= 1)
+  const dist = Math.max(Math.abs(p.x - obj.x), Math.abs(p.y - obj.y));
+  if (dist > 1) {
+    // Pathfind to adjacent tile
+    const adjPath = pathfinding.findAdjacentPath(p.x, p.y, obj.x, obj.y, p.layer);
+    if (!adjPath) return `Can't reach the ${obj.name}.`;
+    if (adjPath.length > 0) {
+      p.path = adjPath;
+      // Schedule gathering to start when we arrive
+      p._pendingGather = { skill, verb, objKey: `${obj.layer}_${obj.x}_${obj.y}` };
+      return `Walking to ${obj.name}... (${adjPath.length} tiles)`;
+    }
   }
+  return startGathering(p, ws, skill, verb, obj);
+}
+
+commands.register('chop', { help: 'Chop a tree (repeating)', category: 'Gathering',
+  fn: (p, args) => gatherWithWalk(p, args.join(' '), 'woodcutting', 'chop', 'tree')
 });
 
 commands.register('mine', { help: 'Mine a rock (repeating)', category: 'Gathering',
-  fn: (p, args) => {
-    const name = args.join(' ') || 'rock';
-    const obj = objects.findObjectByName(name, p.x, p.y, 3, p.layer);
-    if (!obj) return `No "${name}" nearby.`;
-    if (obj.skill !== 'mining') return `You can't mine the ${obj.name}.`;
-    let ws; for (const [w, pl] of players) { if (pl === p) { ws = w; break; } }
-    return startGathering(p, ws, 'mining', 'mine', obj);
-  }
+  fn: (p, args) => gatherWithWalk(p, args.join(' '), 'mining', 'mine', 'rock')
 });
 
 commands.register('fish', { help: 'Fish at a spot (repeating)', category: 'Gathering',
-  fn: (p, args) => {
-    const name = args.join(' ') || 'fishing spot';
-    const obj = objects.findObjectByName(name, p.x, p.y, 5, p.layer);
-    if (!obj) return `No "${name}" nearby.`;
-    if (obj.skill !== 'fishing') return `You can't fish the ${obj.name}.`;
-    let ws; for (const [w, pl] of players) { if (pl === p) { ws = w; break; } }
-    return startGathering(p, ws, 'fishing', 'fish at', obj);
-  }
+  fn: (p, args) => gatherWithWalk(p, args.join(' '), 'fishing', 'fish at', 'fishing spot')
 });
 
 commands.register('stop', { help: 'Stop current action', aliases: ['cancel'], category: 'General',
   fn: (p) => {
-    if (!p.busy && !actions.isActive(p)) return 'You aren\'t doing anything.';
+    if (!p.busy && !actions.isActive(p) && !p.combatTarget && !p.pvpTarget) return 'You aren\'t doing anything.';
     if (p.combatTarget) { p.combatTarget = null; }
+    if (p.pvpTarget) { p.pvpTarget = null; }
     actions.cancel(p);
+    p.path = [];
     return 'You stop what you\'re doing.';
   }
 });
@@ -1154,120 +1289,298 @@ commands.register('save', { help: 'Save world', category: 'Build', admin: true,
 
 // ── Default content ───────────────────────────────────────────────────────────
 function createDefaultContent() {
-  // NPCs
+  const T = tiles.T;
+
+  // ── NPC Definitions ────────────────────────────────────────────────────────
   npcs.defineNpc('goblin', { name: 'Goblin', examine: 'An ugly green creature.', combat: 2, maxHp: 5, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 4, wanderRadius: 4, respawnTicks: 25,
-    drops: [{ id: 100, name: 'bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'coins', weight: 8, min: 1, max: 5 }] });
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 8, min: 1, max: 5 }],
+    thieving: { level: 1, xp: 10, loot: [{ id: 101, name: 'Coins', min: 1, max: 5 }], stunDamage: 1 }
+  });
   npcs.defineNpc('cow', { name: 'Cow', examine: 'Moo.', combat: 2, maxHp: 8, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 5, wanderRadius: 6, respawnTicks: 20,
-    drops: [{ id: 102, name: 'cowhide', weight: 10, min: 1, max: 1 }, { id: 103, name: 'raw beef', weight: 8, min: 1, max: 1 }, { id: 100, name: 'bones', weight: 10, min: 1, max: 1 }] });
+    drops: [{ id: 102, name: 'Cowhide', weight: 10, min: 1, max: 1 }, { id: 103, name: 'Raw beef', weight: 8, min: 1, max: 1 }, { id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }] });
   npcs.defineNpc('chicken', { name: 'Chicken', examine: 'Cluck.', combat: 1, maxHp: 3, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 4, wanderRadius: 3, respawnTicks: 15,
-    drops: [{ id: 104, name: 'feather', weight: 10, min: 5, max: 15 }, { id: 105, name: 'raw chicken', weight: 8, min: 1, max: 1 }, { id: 100, name: 'bones', weight: 10, min: 1, max: 1 }] });
-  npcs.defineNpc('guard', { name: 'Guard', examine: 'A Lumbridge guard.', combat: 21, maxHp: 22, stats: { attack: 18, strength: 14, defence: 18, def_slash: 24 }, maxHit: 3, attackSpeed: 4, wanderRadius: 3, respawnTicks: 30,
-    drops: [{ id: 100, name: 'bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'coins', weight: 6, min: 10, max: 30 }] });
-  npcs.defineNpc('hans', { name: 'Hans', examine: 'A man walking around the castle.', combat: 0, maxHp: 1, wanderRadius: 10, dialogue: 'Hello adventurer! Welcome to OpenScape.' });
+    drops: [{ id: 104, name: 'Feather', weight: 10, min: 5, max: 15 }, { id: 105, name: 'Raw chicken', weight: 8, min: 1, max: 1 }, { id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }] });
+  npcs.defineNpc('guard', { name: 'Guard', examine: 'A town guard.', combat: 21, maxHp: 22, stats: { attack: 18, strength: 14, defence: 18, def_slash: 24 }, maxHit: 3, attackSpeed: 4, wanderRadius: 3, respawnTicks: 30,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 10, max: 30 }],
+    thieving: { level: 40, xp: 46, loot: [{ id: 101, name: 'Coins', min: 15, max: 50 }], stunDamage: 2 }
+  });
+  npcs.defineNpc('hans', { name: 'Hans', examine: 'A man walking around the castle.', combat: 0, maxHp: 1, wanderRadius: 10, dialogue: 'Hello adventurer! Welcome to OpenScape.',
+    thieving: { level: 1, xp: 8, loot: [{ id: 101, name: 'Coins', min: 1, max: 3 }], stunDamage: 1 }
+  });
+  npcs.defineNpc('man', { name: 'Man', examine: 'A man.', combat: 2, maxHp: 7, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 4, wanderRadius: 5, respawnTicks: 20,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }],
+    thieving: { level: 1, xp: 8, loot: [{ id: 101, name: 'Coins', min: 1, max: 3 }], stunDamage: 1 }
+  });
+  npcs.defineNpc('woman', { name: 'Woman', examine: 'A woman.', combat: 2, maxHp: 7, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 4, wanderRadius: 5, respawnTicks: 20,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }],
+    thieving: { level: 1, xp: 8, loot: [{ id: 101, name: 'Coins', min: 1, max: 3 }], stunDamage: 1 }
+  });
+  npcs.defineNpc('farmer', { name: 'Farmer', examine: 'A farmer tending crops.', combat: 7, maxHp: 10, stats: { attack: 5, strength: 3, defence: 4 }, maxHit: 1, attackSpeed: 4, wanderRadius: 4, respawnTicks: 20,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }],
+    thieving: { level: 10, xp: 14, loot: [{ id: 101, name: 'Coins', min: 3, max: 9 }], stunDamage: 1 }
+  });
+  npcs.defineNpc('warrior', { name: 'Warrior', examine: 'A warrior.', combat: 18, maxHp: 20, stats: { attack: 12, strength: 10, defence: 14 }, maxHit: 3, attackSpeed: 4, wanderRadius: 4, respawnTicks: 25,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 5, max: 20 }],
+    thieving: { level: 25, xp: 26, loot: [{ id: 101, name: 'Coins', min: 10, max: 25 }], stunDamage: 2 }
+  });
+  npcs.defineNpc('knight', { name: 'Knight', examine: 'A White Knight.', combat: 36, maxHp: 34, stats: { attack: 30, strength: 25, defence: 30 }, maxHit: 4, attackSpeed: 4, wanderRadius: 3, respawnTicks: 30,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 20, max: 60 }],
+    thieving: { level: 55, xp: 84, loot: [{ id: 101, name: 'Coins', min: 30, max: 80 }], stunDamage: 3 }
+  });
+  npcs.defineNpc('hill_giant', { name: 'Hill Giant', examine: 'A very large humanoid.', combat: 28, maxHp: 35, stats: { attack: 18, strength: 22, defence: 26, def_slash: 18 }, maxHit: 4, attackSpeed: 4, wanderRadius: 4, respawnTicks: 30,
+    drops: [{ id: 106, name: 'Big bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 10, max: 50 }] });
+  npcs.defineNpc('lesser_demon', { name: 'Lesser Demon', examine: 'A demon from the underworld.', combat: 82, maxHp: 79, stats: { attack: 68, strength: 67, defence: 71, def_slash: 42 }, maxHit: 8, attackSpeed: 4, wanderRadius: 3, respawnTicks: 30,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }] });
+  npcs.defineNpc('green_dragon', { name: 'Green Dragon', examine: 'A green dragon.', combat: 79, maxHp: 75, stats: { attack: 68, strength: 66, defence: 64, def_slash: 40 }, maxHit: 8, attackSpeed: 4, wanderRadius: 3, respawnTicks: 40,
+    drops: [{ id: 107, name: 'Dragon bones', weight: 10, min: 1, max: 1 }] });
+  npcs.defineNpc('moss_giant', { name: 'Moss Giant', examine: 'A large moss-covered humanoid.', combat: 42, maxHp: 60, stats: { attack: 30, strength: 30, defence: 30, def_slash: 20 }, maxHit: 5, attackSpeed: 4, wanderRadius: 4, respawnTicks: 30,
+    drops: [{ id: 106, name: 'Big bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 20, max: 80 }] });
+  npcs.defineNpc('dark_wizard', { name: 'Dark Wizard', examine: 'A wizard of the dark arts.', combat: 20, maxHp: 19, stats: { attack: 15, strength: 12, defence: 10 }, maxHit: 4, aggressive: true, aggroRange: 5, attackSpeed: 5, wanderRadius: 3, respawnTicks: 25,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 274, name: 'Mind rune', weight: 6, min: 5, max: 15 }] });
+  npcs.defineNpc('skeleton', { name: 'Skeleton', examine: 'A reanimated skeleton.', combat: 22, maxHp: 23, stats: { attack: 16, strength: 14, defence: 16 }, maxHit: 3, aggressive: true, aggroRange: 4, attackSpeed: 4, wanderRadius: 4, respawnTicks: 25,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 5, max: 20 }] });
+  npcs.defineNpc('zombie', { name: 'Zombie', examine: 'The undead.', combat: 24, maxHp: 25, stats: { attack: 17, strength: 16, defence: 15 }, maxHit: 3, aggressive: true, aggroRange: 4, attackSpeed: 4, wanderRadius: 3, respawnTicks: 25,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }] });
+  npcs.defineNpc('greater_demon', { name: 'Greater Demon', examine: 'A powerful demon.', combat: 92, maxHp: 87, stats: { attack: 78, strength: 80, defence: 75, def_slash: 50 }, maxHit: 10, aggressive: true, aggroRange: 5, attackSpeed: 4, wanderRadius: 3, respawnTicks: 35,
+    drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 30, max: 100 }] });
+  npcs.defineNpc('giant_spider', { name: 'Giant Spider', examine: 'A very large spider.', combat: 2, maxHp: 4, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 4, wanderRadius: 5, respawnTicks: 15, drops: [] });
+  npcs.defineNpc('scorpion', { name: 'Scorpion', examine: 'A dangerous scorpion.', combat: 14, maxHp: 17, stats: { attack: 10, strength: 8, defence: 8 }, maxHit: 2, aggressive: true, aggroRange: 3, attackSpeed: 4, wanderRadius: 3, respawnTicks: 20, drops: [] });
 
-  // Objects
-  objects.defineObject('tree', { name: 'Tree', examine: 'A tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 1, xp: 25, ticks: 4, product: { id: 200, name: 'logs', count: 1 }, depletionChance: 0.5, respawnTicks: 15 });
-  objects.defineObject('oak', { name: 'Oak tree', examine: 'An oak tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 15, xp: 37, ticks: 4, product: { id: 201, name: 'oak logs', count: 1 }, depletionChance: 0.35, respawnTicks: 20 });
-  objects.defineObject('willow', { name: 'Willow tree', examine: 'A willow tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 30, xp: 67, ticks: 4, product: { id: 202, name: 'willow logs', count: 1 }, depletionChance: 0.25, respawnTicks: 25 });
-  objects.defineObject('copper_rock', { name: 'Copper rock', examine: 'A rock containing copper ore.', actions: ['mine'], skill: 'mining', levelReq: 1, xp: 17, ticks: 4, product: { id: 210, name: 'copper ore', count: 1 }, depletionChance: 1.0, respawnTicks: 4 });
-  objects.defineObject('tin_rock', { name: 'Tin rock', examine: 'A rock containing tin ore.', actions: ['mine'], skill: 'mining', levelReq: 1, xp: 17, ticks: 4, product: { id: 211, name: 'tin ore', count: 1 }, depletionChance: 1.0, respawnTicks: 4 });
-  objects.defineObject('iron_rock', { name: 'Iron rock', examine: 'A rock containing iron ore.', actions: ['mine'], skill: 'mining', levelReq: 15, xp: 35, ticks: 4, product: { id: 212, name: 'iron ore', count: 1 }, depletionChance: 1.0, respawnTicks: 9 });
-  objects.defineObject('fishing_spot', { name: 'Fishing spot', examine: 'A good spot to fish.', actions: ['fish'], skill: 'fishing', levelReq: 1, xp: 10, ticks: 5, product: { id: 220, name: 'raw shrimps', count: 1 } });
-
-  // Spawn world content
-  tiles.createSpawn();
-
-  // Place some trees around spawn
-  const trees = [[93, 95], [94, 93], [107, 95], [108, 97], [95, 107], [93, 106]];
-  for (const [x, y] of trees) { tiles.setTile(x, y, tiles.T.TREE); objects.placeObject('tree', x, y); }
-
-  // Some rocks
-  const rocks = [[106, 106], [107, 107], [108, 106]];
-  for (const [x, y] of rocks) { tiles.setTile(x, y, tiles.T.ROCK); objects.placeObject('copper_rock', x, y); }
-
-  objects.placeObject('tin_rock', 109, 106);
-  tiles.setTile(109, 106, tiles.T.ROCK);
-
-  objects.placeObject('fishing_spot', 96, 104);
-  tiles.setTile(96, 104, tiles.T.FISH_SPOT);
-
-  // Spawn NPCs
-  npcs.spawnNpc('hans', 100, 100);
-  npcs.spawnNpc('chicken', 104, 103);
-  npcs.spawnNpc('chicken', 105, 104);
-  npcs.spawnNpc('cow', 108, 100);
-  npcs.spawnNpc('cow', 109, 101);
-  npcs.spawnNpc('goblin', 95, 96);
-  npcs.spawnNpc('goblin', 94, 97);
-
-  // More monsters
-  npcs.defineNpc('hill_giant', { name: 'Hill Giant', examine: 'A very large humanoid.', combat: 28, maxHp: 35, stats: { attack: 18, strength: 22, defence: 26, def_slash: 18 }, maxHit: 4, attackSpeed: 4, wanderRadius: 4, respawnTicks: 30 });
-  npcs.defineNpc('lesser_demon', { name: 'Lesser Demon', examine: 'A demon from the underworld.', combat: 82, maxHp: 79, stats: { attack: 68, strength: 67, defence: 71, def_slash: 42 }, maxHit: 8, attackSpeed: 4, wanderRadius: 3, respawnTicks: 30 });
-  npcs.defineNpc('green_dragon', { name: 'Green Dragon', examine: 'A green dragon.', combat: 79, maxHp: 75, stats: { attack: 68, strength: 66, defence: 64, def_slash: 40 }, maxHit: 8, attackSpeed: 4, wanderRadius: 3, respawnTicks: 40 });
-
-  // Hill giants area (east)
-  tiles.defineArea('giants', { name: 'Giant Plains', x1: 120, y1: 95, x2: 130, y2: 105 });
-  for (let x = 120; x <= 130; x++) for (let y = 95; y <= 105; y++) tiles.setTile(x, y, tiles.T.GRASS);
-  npcs.spawnNpc('hill_giant', 124, 100);
-  npcs.spawnNpc('hill_giant', 126, 98);
-
-  // Town area (north)
-  tiles.defineArea('town', { name: 'Town', x1: 95, y1: 85, x2: 110, y2: 95, safe: true });
-  for (let x = 95; x <= 110; x++) for (let y = 85; y <= 95; y++) tiles.setTile(x, y, tiles.T.PATH);
-
-  // Shop NPCs
-  npcs.defineNpc('shopkeeper', { name: 'Shopkeeper', examine: 'A shopkeeper.', combat: 0, maxHp: 1, wanderRadius: 2, dialogue: 'Want to see my wares? Type `shop shopkeeper`.' });
+  // Shop/NPC definitions
+  npcs.defineNpc('shopkeeper', { name: 'Shopkeeper', examine: 'A general store shopkeeper.', combat: 0, maxHp: 1, wanderRadius: 2, dialogue: 'Want to see my wares? Type `shop shopkeeper`.' });
   npcs.defineNpc('weapon_master', { name: 'Weapon Master', examine: 'A weapon dealer.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Looking for a weapon? Type `shop weapon master`.' });
   npcs.defineNpc('armour_seller', { name: 'Armour Seller', examine: 'An armour dealer.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need some protection? Type `shop armour seller`.' });
   npcs.defineNpc('fishing_tutor', { name: 'Fishing Tutor', examine: 'A fishing instructor.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need supplies? Type `shop fishing tutor`.' });
   npcs.defineNpc('mining_instructor', { name: 'Mining Instructor', examine: 'A mining instructor.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need a pickaxe? Type `shop mining instructor`.' });
   npcs.defineNpc('aubury', { name: 'Aubury', examine: 'A rune shop owner.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Interested in runes? Type `shop aubury`.' });
   npcs.defineNpc('slayer_master', { name: 'Turael', examine: 'A slayer master.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need a task? Type `slayer turael`.' });
-  npcs.defineNpc('cook', { name: 'Cook', examine: 'The castle cook.', combat: 0, maxHp: 1, wanderRadius: 2, dialogue: 'I need help with a cake! Type `startquest cook`.' });
+  npcs.defineNpc('cook_npc', { name: 'Cook', examine: 'The castle cook.', combat: 0, maxHp: 1, wanderRadius: 2, dialogue: 'I need help with a cake! Type `startquest cook`.' });
+  npcs.defineNpc('banker', { name: 'Banker', examine: 'A bank employee.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Type `bank` to access your bank.' });
+  npcs.defineNpc('tanner', { name: 'Tanner', examine: 'A leather worker.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Type `craft leather` to tan hides.' });
+  npcs.defineNpc('herbalist', { name: 'Herbalist', examine: 'A herb shop owner.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need potion supplies? Type `shop herbalist`.' });
 
-  npcs.spawnNpc('shopkeeper', 98, 90);
-  npcs.spawnNpc('weapon_master', 100, 88);
-  npcs.spawnNpc('armour_seller', 102, 88);
-  npcs.spawnNpc('fishing_tutor', 96, 104);
-  npcs.spawnNpc('mining_instructor', 108, 106);
-  npcs.spawnNpc('aubury', 104, 90);
-  npcs.spawnNpc('slayer_master', 106, 90);
-  npcs.spawnNpc('cook', 100, 92);
-
-  // More gathering objects
+  // ── Object Definitions ─────────────────────────────────────────────────────
+  objects.defineObject('tree', { name: 'Tree', examine: 'A tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 1, xp: 25, ticks: 4, product: { id: 200, name: 'Logs', count: 1 }, depletionChance: 0.5, respawnTicks: 15 });
+  objects.defineObject('oak', { name: 'Oak tree', examine: 'An oak tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 15, xp: 37, ticks: 4, product: { id: 201, name: 'Oak logs', count: 1 }, depletionChance: 0.35, respawnTicks: 20 });
+  objects.defineObject('willow', { name: 'Willow tree', examine: 'A willow tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 30, xp: 67, ticks: 4, product: { id: 202, name: 'Willow logs', count: 1 }, depletionChance: 0.25, respawnTicks: 25 });
   objects.defineObject('maple', { name: 'Maple tree', examine: 'A maple tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 45, xp: 100, ticks: 4, product: { id: 203, name: 'Maple logs', count: 1 }, depletionChance: 0.2, respawnTicks: 30 });
   objects.defineObject('yew', { name: 'Yew tree', examine: 'A yew tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 60, xp: 175, ticks: 4, product: { id: 204, name: 'Yew logs', count: 1 }, depletionChance: 0.15, respawnTicks: 50 });
+  objects.defineObject('copper_rock', { name: 'Copper rock', examine: 'A rock containing copper ore.', actions: ['mine'], skill: 'mining', levelReq: 1, xp: 17, ticks: 4, product: { id: 210, name: 'Copper ore', count: 1 }, depletionChance: 1.0, respawnTicks: 4 });
+  objects.defineObject('tin_rock', { name: 'Tin rock', examine: 'A rock containing tin ore.', actions: ['mine'], skill: 'mining', levelReq: 1, xp: 17, ticks: 4, product: { id: 211, name: 'Tin ore', count: 1 }, depletionChance: 1.0, respawnTicks: 4 });
+  objects.defineObject('iron_rock', { name: 'Iron rock', examine: 'A rock containing iron ore.', actions: ['mine'], skill: 'mining', levelReq: 15, xp: 35, ticks: 4, product: { id: 212, name: 'Iron ore', count: 1 }, depletionChance: 1.0, respawnTicks: 9 });
   objects.defineObject('coal_rock', { name: 'Coal rock', examine: 'A rock containing coal.', actions: ['mine'], skill: 'mining', levelReq: 30, xp: 50, ticks: 4, product: { id: 213, name: 'Coal', count: 1 }, depletionChance: 1.0, respawnTicks: 49 });
+  objects.defineObject('gold_rock', { name: 'Gold rock', examine: 'A rock containing gold.', actions: ['mine'], skill: 'mining', levelReq: 40, xp: 65, ticks: 4, product: { id: 214, name: 'Gold ore', count: 1 }, depletionChance: 1.0, respawnTicks: 100 });
   objects.defineObject('mithril_rock', { name: 'Mithril rock', examine: 'A rock containing mithril.', actions: ['mine'], skill: 'mining', levelReq: 55, xp: 80, ticks: 4, product: { id: 215, name: 'Mithril ore', count: 1 }, depletionChance: 1.0, respawnTicks: 200 });
-  objects.defineObject('fly_fishing_spot', { name: 'Fishing spot', examine: 'A trout/salmon spot.', actions: ['fish'], skill: 'fishing', levelReq: 20, xp: 50, ticks: 5, product: { id: 221, name: 'Raw trout', count: 1 } });
+  objects.defineObject('fishing_spot', { name: 'Fishing spot', examine: 'A good spot to fish.', actions: ['fish'], skill: 'fishing', levelReq: 1, xp: 10, ticks: 5, product: { id: 220, name: 'Raw shrimps', count: 1 } });
+  objects.defineObject('fly_fishing_spot', { name: 'Fly fishing spot', examine: 'A trout/salmon spot.', actions: ['fish'], skill: 'fishing', levelReq: 20, xp: 50, ticks: 5, product: { id: 221, name: 'Raw trout', count: 1 } });
   objects.defineObject('cage_fishing_spot', { name: 'Cage/Harpoon spot', examine: 'A lobster/swordfish spot.', actions: ['fish'], skill: 'fishing', levelReq: 40, xp: 90, ticks: 5, product: { id: 223, name: 'Raw lobster', count: 1 } });
   objects.defineObject('range', { name: 'Cooking range', examine: 'A range for cooking.', actions: ['cook'] });
   objects.defineObject('furnace', { name: 'Furnace', examine: 'A furnace for smelting.', actions: ['smelt'] });
   objects.defineObject('anvil', { name: 'Anvil', examine: 'An anvil for smithing.', actions: ['smith'] });
   objects.defineObject('bank_booth', { name: 'Bank booth', examine: 'A bank booth.', actions: ['bank'] });
   objects.defineObject('spinning_wheel', { name: 'Spinning wheel', examine: 'A spinning wheel.', actions: ['spin'] });
+  objects.defineObject('wheat', { name: 'Wheat', examine: 'A field of wheat.', actions: ['pick'] });
+  objects.defineObject('warning_sign', { name: 'Warning sign', examine: 'DANGER: Wilderness ahead! PvP is enabled beyond this point.' });
+  objects.defineObject('agility_log', { name: 'Balancing log', examine: 'A narrow log to balance on.' });
+  objects.defineObject('agility_net', { name: 'Obstacle net', examine: 'A net to climb.' });
+  objects.defineObject('agility_wall', { name: 'Low wall', examine: 'A wall to climb over.' });
+  objects.defineObject('agility_rooftop', { name: 'Rooftop edge', examine: 'A roof edge to cross.' });
+  objects.defineObject('agility_gap', { name: 'Gap', examine: 'A gap to jump across.' });
+  objects.defineObject('agility_ladder', { name: 'Ladder', examine: 'A ladder to climb.' });
 
-  // Place town objects
-  objects.placeObject('range', 99, 92);
-  objects.placeObject('furnace', 101, 92);
-  objects.placeObject('anvil', 103, 92);
-  objects.placeObject('bank_booth', 98, 88);
-  objects.placeObject('spinning_wheel', 105, 92);
+  // ── Helper functions ───────────────────────────────────────────────────────
+  function fillArea(x1, y1, x2, y2, tile) {
+    for (let x = x1; x <= x2; x++) for (let y = y1; y <= y2; y++) tiles.setTile(x, y, tile);
+  }
+  function pathLine(x1, y1, x2, y2) {
+    if (x1 !== x2) { const s = x1 < x2 ? 1 : -1; for (let x = x1; x !== x2 + s; x += s) tiles.setTile(x, y1, T.PATH); }
+    if (y1 !== y2) { const s = y1 < y2 ? 1 : -1; for (let y = y1; y !== y2 + s; y += s) tiles.setTile(x2, y, T.PATH); }
+  }
 
-  // More trees
-  objects.placeObject('oak', 92, 98);
-  objects.placeObject('oak', 91, 99);
-  objects.placeObject('willow', 90, 102);
-  objects.placeObject('willow', 89, 103);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SPAWN ISLAND (95-105, 95-105)
+  // ═══════════════════════════════════════════════════════════════════════════
+  tiles.createSpawn();
+  tiles.defineArea('spawn', { name: 'Spawn Island', x1: 95, y1: 95, x2: 105, y2: 105, safe: true });
+  npcs.spawnNpc('hans', 100, 100);
+  npcs.spawnNpc('chicken', 104, 103);
+  npcs.spawnNpc('chicken', 105, 104);
+  npcs.spawnNpc('chicken', 103, 104);
+  const spawnTrees = [[93, 95], [94, 93], [107, 95], [108, 97], [95, 107], [93, 106]];
+  for (const [x, y] of spawnTrees) { tiles.setTile(x, y, T.TREE); objects.placeObject('tree', x, y); }
+  const spawnRocks = [[106, 106], [107, 107], [108, 106]];
+  for (const [x, y] of spawnRocks) { tiles.setTile(x, y, T.ROCK); objects.placeObject('copper_rock', x, y); }
+  tiles.setTile(109, 106, T.ROCK); objects.placeObject('tin_rock', 109, 106);
+  tiles.setTile(96, 104, T.FISH_SPOT); objects.placeObject('fishing_spot', 96, 104);
 
-  // More rocks
-  objects.placeObject('iron_rock', 110, 107);
-  objects.placeObject('coal_rock', 111, 107);
-  objects.placeObject('coal_rock', 112, 107);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TOWN (90-115, 80-95) — shops, bank, crafting stations
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(90, 80, 115, 95, T.PATH);
+  tiles.defineArea('town', { name: 'Town', x1: 90, y1: 80, x2: 115, y2: 95, safe: true });
+  fillArea(96, 86, 100, 90, T.FLOOR);   // General store
+  fillArea(102, 86, 106, 90, T.FLOOR);  // Weapon shop
+  fillArea(108, 86, 112, 90, T.FLOOR);  // Armour shop
+  fillArea(96, 81, 100, 84, T.FLOOR);   // Bank
+  fillArea(102, 81, 106, 84, T.FLOOR);  // Smithy
+  fillArea(108, 81, 112, 84, T.FLOOR);  // Kitchen
+  fillArea(90, 86, 94, 90, T.FLOOR);    // Herb shop
+  objects.placeObject('bank_booth', 97, 82);
+  objects.placeObject('bank_booth', 98, 82);
+  objects.placeObject('bank_booth', 99, 82);
+  objects.placeObject('range', 109, 82);
+  objects.placeObject('range', 110, 82);
+  objects.placeObject('furnace', 103, 82);
+  objects.placeObject('furnace', 104, 82);
+  objects.placeObject('anvil', 105, 82);
+  objects.placeObject('anvil', 106, 82);
+  objects.placeObject('spinning_wheel', 112, 88);
+  npcs.spawnNpc('shopkeeper', 98, 88);
+  npcs.spawnNpc('weapon_master', 104, 88);
+  npcs.spawnNpc('armour_seller', 110, 88);
+  npcs.spawnNpc('aubury', 114, 88);
+  npcs.spawnNpc('slayer_master', 113, 82);
+  npcs.spawnNpc('cook_npc', 109, 83);
+  npcs.spawnNpc('banker', 98, 83);
+  npcs.spawnNpc('tanner', 92, 88);
+  npcs.spawnNpc('herbalist', 91, 87);
+  npcs.spawnNpc('mining_instructor', 103, 83);
+  npcs.spawnNpc('man', 95, 92);
+  npcs.spawnNpc('man', 100, 93);
+  npcs.spawnNpc('woman', 105, 93);
+  npcs.spawnNpc('woman', 110, 92);
+  npcs.spawnNpc('farmer', 92, 93);
+  npcs.spawnNpc('warrior', 108, 85);
+  npcs.spawnNpc('knight', 114, 85);
+  npcs.spawnNpc('guard', 95, 85);
+  npcs.spawnNpc('guard', 112, 85);
 
-  // More fishing
-  objects.placeObject('fly_fishing_spot', 94, 106);
-  tiles.setTile(94, 106, tiles.T.FISH_SPOT);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // LUMBRIDGE FIELDS (75-90, 95-115) — cows, chickens, wheat
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(75, 95, 90, 115, T.GRASS);
+  tiles.defineArea('fields', { name: 'Lumbridge Fields', x1: 75, y1: 95, x2: 90, y2: 115 });
+  npcs.spawnNpc('cow', 82, 98); npcs.spawnNpc('cow', 84, 99); npcs.spawnNpc('cow', 86, 100);
+  npcs.spawnNpc('cow', 83, 101); npcs.spawnNpc('cow', 85, 97);
+  npcs.spawnNpc('chicken', 77, 97); npcs.spawnNpc('chicken', 78, 98);
+  npcs.spawnNpc('chicken', 77, 99); npcs.spawnNpc('chicken', 79, 97);
+  fillArea(76, 105, 85, 113, T.FLOWER);
+  for (let x = 77; x <= 84; x += 2) for (let y = 106; y <= 112; y += 2) objects.placeObject('wheat', x, y);
+  npcs.spawnNpc('farmer', 80, 110); npcs.spawnNpc('farmer', 84, 108);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FOREST (70-90, 70-95) — normal, oak, willow, maple, yew trees
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(70, 70, 90, 94, T.DARK_GRASS);
+  tiles.defineArea('forest', { name: 'Forest', x1: 70, y1: 70, x2: 90, y2: 94 });
+  const forestTrees = [[72,72],[74,73],[76,74],[78,71],[73,76],[75,78],[71,80],[77,82],[79,84],[72,86],[74,88],[76,90],[71,92],[73,94]];
+  for (const [x, y] of forestTrees) { tiles.setTile(x, y, T.TREE); objects.placeObject('tree', x, y); }
+  const oakTrees = [[80,72],[82,74],[84,76],[81,78],[83,80],[85,82],[80,84],[82,86],[84,88],[86,90]];
+  for (const [x, y] of oakTrees) { tiles.setTile(x, y, T.TREE); objects.placeObject('oak', x, y); }
+  const willowTrees = [[88,72],[89,74],[88,76],[87,78],[86,80],[89,82],[88,84],[87,86],[89,88]];
+  for (const [x, y] of willowTrees) { tiles.setTile(x, y, T.TREE); objects.placeObject('willow', x, y); }
+  const mapleTrees = [[72,82],[74,84],[76,86]];
+  for (const [x, y] of mapleTrees) { tiles.setTile(x, y, T.TREE); objects.placeObject('maple', x, y); }
+  tiles.setTile(71, 75, T.TREE); objects.placeObject('yew', 71, 75);
+  tiles.setTile(73, 90, T.TREE); objects.placeObject('yew', 73, 90);
+  npcs.spawnNpc('giant_spider', 75, 75); npcs.spawnNpc('giant_spider', 82, 78); npcs.spawnNpc('giant_spider', 78, 85);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MINING SITE (115-130, 100-115) — copper, tin, iron, coal, gold, mithril
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(115, 100, 130, 115, T.GRASS);
+  tiles.defineArea('mines', { name: 'Mining Site', x1: 115, y1: 100, x2: 130, y2: 115 });
+  for (const [x, y] of [[117,102],[118,103],[119,102]]) { tiles.setTile(x, y, T.ROCK); objects.placeObject('copper_rock', x, y); }
+  for (const [x, y] of [[121,102],[122,103],[123,102]]) { tiles.setTile(x, y, T.ROCK); objects.placeObject('tin_rock', x, y); }
+  for (const [x, y] of [[117,106],[118,107],[119,106],[120,107]]) { tiles.setTile(x, y, T.ROCK); objects.placeObject('iron_rock', x, y); }
+  for (const [x, y] of [[123,106],[124,107],[125,106],[126,107],[127,106]]) { tiles.setTile(x, y, T.ROCK); objects.placeObject('coal_rock', x, y); }
+  tiles.setTile(128, 110, T.ROCK); objects.placeObject('gold_rock', 128, 110);
+  tiles.setTile(129, 111, T.ROCK); objects.placeObject('gold_rock', 129, 111);
+  tiles.setTile(128, 113, T.ROCK); objects.placeObject('mithril_rock', 128, 113);
+  tiles.setTile(129, 114, T.ROCK); objects.placeObject('mithril_rock', 129, 114);
+  npcs.spawnNpc('scorpion', 125, 110); npcs.spawnNpc('scorpion', 120, 112);
+  npcs.spawnNpc('mining_instructor', 116, 101);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FISHING DOCK (85-95, 115-125) — multiple fishing spots
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(85, 115, 95, 120, T.SAND);
+  fillArea(85, 121, 95, 125, T.WATER);
+  fillArea(88, 120, 92, 122, T.FLOOR); // dock walkway
+  tiles.defineArea('dock', { name: 'Fishing Dock', x1: 85, y1: 115, x2: 95, y2: 125 });
+  tiles.setTile(88, 123, T.FISH_SPOT); objects.placeObject('fishing_spot', 88, 123);
+  tiles.setTile(89, 123, T.FISH_SPOT); objects.placeObject('fishing_spot', 89, 123);
+  tiles.setTile(90, 123, T.FISH_SPOT); objects.placeObject('fishing_spot', 90, 123);
+  tiles.setTile(91, 123, T.FISH_SPOT); objects.placeObject('fly_fishing_spot', 91, 123);
+  tiles.setTile(92, 123, T.FISH_SPOT); objects.placeObject('fly_fishing_spot', 92, 123);
+  tiles.setTile(88, 124, T.FISH_SPOT); objects.placeObject('cage_fishing_spot', 88, 124);
+  npcs.spawnNpc('fishing_tutor', 90, 118);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // GOBLIN VILLAGE (70-80, 60-70) — many goblins, guard
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(70, 60, 80, 70, T.GRASS);
+  fillArea(73, 63, 77, 67, T.FLOOR);
+  tiles.defineArea('goblin_village', { name: 'Goblin Village', x1: 70, y1: 60, x2: 80, y2: 70 });
+  npcs.spawnNpc('goblin', 73, 63); npcs.spawnNpc('goblin', 75, 64); npcs.spawnNpc('goblin', 77, 65);
+  npcs.spawnNpc('goblin', 74, 66); npcs.spawnNpc('goblin', 76, 67); npcs.spawnNpc('goblin', 72, 65);
+  npcs.spawnNpc('goblin', 78, 63); npcs.spawnNpc('goblin', 71, 68);
+  npcs.spawnNpc('guard', 75, 70);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // GIANT PLAINS (120-135, 85-100) — hill giants, moss giants
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(120, 85, 135, 100, T.GRASS);
+  tiles.defineArea('giant_plains', { name: 'Giant Plains', x1: 120, y1: 85, x2: 135, y2: 100 });
+  npcs.spawnNpc('hill_giant', 124, 90); npcs.spawnNpc('hill_giant', 126, 92);
+  npcs.spawnNpc('hill_giant', 128, 88); npcs.spawnNpc('hill_giant', 130, 94); npcs.spawnNpc('hill_giant', 132, 90);
+  npcs.spawnNpc('moss_giant', 125, 96); npcs.spawnNpc('moss_giant', 130, 98); npcs.spawnNpc('moss_giant', 134, 95);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // WILDERNESS BORDER (60-140, 40-55) — aggressive monsters, PvP
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(60, 55, 140, 58, T.DARK_GRASS);
+  fillArea(60, 40, 140, 54, T.DARK_GRASS);
+  tiles.defineArea('wilderness_border', { name: 'Wilderness Border', x1: 60, y1: 55, x2: 140, y2: 58 });
+  tiles.defineArea('wilderness', { name: 'Wilderness', x1: 60, y1: 40, x2: 140, y2: 54, pvp: true });
+  objects.placeObject('warning_sign', 80, 56);
+  objects.placeObject('warning_sign', 100, 56);
+  objects.placeObject('warning_sign', 120, 56);
+  npcs.spawnNpc('skeleton', 80, 50); npcs.spawnNpc('skeleton', 85, 48); npcs.spawnNpc('skeleton', 90, 52);
+  npcs.spawnNpc('zombie', 95, 45); npcs.spawnNpc('zombie', 100, 48); npcs.spawnNpc('zombie', 105, 50);
+  npcs.spawnNpc('dark_wizard', 110, 46); npcs.spawnNpc('dark_wizard', 115, 50);
+  npcs.spawnNpc('greater_demon', 100, 42); npcs.spawnNpc('lesser_demon', 120, 44);
+  npcs.spawnNpc('green_dragon', 130, 45); npcs.spawnNpc('green_dragon', 135, 48);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PATH NETWORK — connect all areas
+  // ═══════════════════════════════════════════════════════════════════════════
+  pathLine(100, 95, 100, 80);       // Spawn to Town
+  pathLine(95, 100, 75, 100);       // Spawn to Fields
+  pathLine(90, 100, 90, 95);        // Fields to Town SW
+  pathLine(105, 100, 115, 100);     // Spawn to Mining Site
+  pathLine(115, 100, 115, 115);     // Mining path south
+  pathLine(100, 105, 100, 115);     // Spawn to Dock
+  pathLine(90, 115, 100, 115);      // Dock to spawn path
+  pathLine(90, 85, 80, 85);         // Town to Forest
+  pathLine(80, 85, 80, 95);         // Forest path south
+  pathLine(115, 90, 120, 90);       // Town to Giant Plains
+  pathLine(75, 70, 75, 60);         // Forest to Goblin Village
+  pathLine(70, 70, 80, 70);         // Goblin Village east-west
+  pathLine(100, 80, 100, 56);       // Town to Wilderness Border
+  pathLine(80, 56, 120, 56);        // Wilderness border east-west
+  pathLine(85, 110, 85, 115);       // Fields to Dock
+  pathLine(120, 100, 120, 90);      // Mining to Giant Plains
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // AGILITY COURSE — rooftop course in Town
+  // ═══════════════════════════════════════════════════════════════════════════
+  objects.placeObject('agility_wall', 95, 80);
+  objects.placeObject('agility_rooftop', 95, 82);
+  objects.placeObject('agility_gap', 98, 80);
+  objects.placeObject('agility_net', 101, 80);
+  objects.placeObject('agility_log', 104, 80);
+  objects.placeObject('agility_ladder', 107, 80);
 
   console.log(`[init] Default world created with ${npcs.npcs.size} NPCs, ${objects.objects.size} objects`);
 }
@@ -1338,6 +1651,16 @@ wss.on('connection', (ws) => {
 
     // Execute command
     logEntry(ws, 'in', input);
+    // Check stun
+    if (p.stunTicks > 0) {
+      const parsed = commands.parse(input);
+      // Allow non-action commands while stunned
+      const safeCommands = ['help', 'skills', 'stats', 'inventory', 'inv', 'i', 'equipment', 'gear', 'hp', 'pos', 'whoami', 'look', 'l'];
+      if (parsed && !safeCommands.includes(parsed.verb)) {
+        sendText(ws, `You are stunned! (${p.stunTicks} ticks remaining)`);
+        return;
+      }
+    }
     const result = commands.execute(p, input);
     if (result) sendText(ws, result);
   });
@@ -1381,8 +1704,9 @@ tick.onTick('shops', (t) => shopSystem.restockTick(t));
 // Register all Tier 6-18 commands
 registerAllCommands({
   players, playersByName, groundItems, tick, events, persistence,
-  tiles, walls, npcs, objects, pathfinding, combat,
+  tiles, walls, npcs, objects, pathfinding, combat, actions,
   getLevel, getXp, addXp, totalLevel, combatLevel,
+  getBoostedLevel, calcWeight,
   invAdd, invRemove, invCount, invFreeSlots,
   send, sendText, broadcast, findPlayer, nextItemId,
 });

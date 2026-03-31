@@ -45,13 +45,14 @@ function getEquipBonus(equipment, stat) {
   return total;
 }
 
-// Effective level = (base_level + style_bonus + 8) × prayer_mult
+// Effective level = (base_level + potion_boost + style_bonus + 8) × prayer_mult
 function effectiveLevel(p, skill) {
   const style = STYLES[p.attackStyle] || STYLES.accurate;
   const base = player.getLevel(p, skill);
+  const potionBoost = (p.boosts && p.boosts[skill] && p.boosts[skill].ticksLeft > 0) ? p.boosts[skill].amount : 0;
   const styleBonus = style.bonus === skill || style.bonus === 'shared' ? style.invisible : 0;
   const prayerMult = getPrayerMultiplier(p.activePrayers, skill);
-  return Math.floor((base + styleBonus + 8) * prayerMult);
+  return Math.floor((base + potionBoost + styleBonus + 8) * prayerMult);
 }
 
 // Max hit (melee) = floor(0.5 + effective_str × (str_bonus + 64) / 640)

@@ -84,6 +84,13 @@ function createPlayer(id, name) {
     busyAction: null,
     connected: true,
     loginTick: 0,
+
+    // Potion boosts: { skill: { amount, ticksLeft } }
+    boosts: {},
+    // Stun (thieving fail etc): ticks remaining where player can't act
+    stunTicks: 0,
+    // Agility lap tracking: { courseId, obstaclesDone: Set }
+    agilityLap: null,
   };
 }
 
@@ -195,9 +202,37 @@ function unequip(p, slot) {
   return item;
 }
 
+// Get effective level including potion boosts
+function getBoostedLevel(p, skill) {
+  const base = getLevel(p, skill);
+  const boost = p.boosts?.[skill];
+  if (boost && boost.ticksLeft > 0) return base + boost.amount;
+  return base;
+}
+
+// Calculate weight from inventory + equipment using item definitions getter
+function calcWeight(p, itemsGet) {
+  let w = 0;
+  for (const slot of p.inventory) {
+    if (slot) {
+      const def = itemsGet(slot.id);
+      if (def) w += def.weight * (slot.count || 1);
+    }
+  }
+  for (const item of Object.values(p.equipment)) {
+    if (item) {
+      const def = itemsGet(item.id);
+      if (def) w += def.weight;
+    }
+  }
+  p.weight = Math.round(w * 100) / 100;
+  return p.weight;
+}
+
 module.exports = {
   createPlayer, combatLevel,
   getLevel, getXp, addXp, totalLevel,
+  getBoostedLevel, calcWeight,
   invAdd, invRemove, invCount, invFreeSlots,
   equip, unequip,
   SKILLS, COMBAT_SKILLS, EQUIP_SLOTS, INV_SIZE, BANK_SIZE,
