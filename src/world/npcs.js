@@ -25,6 +25,7 @@ function defineNpc(defId, opts) {
     drops: opts.drops || [], // [{ id, name, weight, min, max }]
     dialogue: opts.dialogue || null,
     thieving: opts.thieving || null, // { level, xp, loot, stunDamage }
+    poisonDamage: opts.poisonDamage || 0, // max poison damage (0 = no poison)
   });
 }
 
@@ -41,6 +42,7 @@ function spawnNpc(defId, x, y, layer = 0) {
     nextAttackTick: 0,
     dead: false,
     respawnAt: 0,
+    aggroTimers: new Map(), // playerId → tick when aggro started (for 10min timeout)
   };
   npcs.set(id, npc);
   return npc;

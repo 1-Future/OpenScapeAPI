@@ -22,6 +22,19 @@ module.exports = function registerAll(ctx) {
     if (calcWeight) calcWeight(p, (id) => items.get(id));
   }
 
+  // Helper: compact skill name for XP drops (feature 11)
+  const SKILL_SHORT = {
+    attack: 'Att', strength: 'Str', defence: 'Def', hitpoints: 'HP',
+    ranged: 'Range', prayer: 'Prayer', magic: 'Magic', runecrafting: 'RC',
+    construction: 'Con', agility: 'Agil', herblore: 'Herb', thieving: 'Thieving',
+    crafting: 'Craft', fletching: 'Fletch', slayer: 'Slay', hunter: 'Hunter',
+    mining: 'Mining', smithing: 'Smith', fishing: 'Fish', cooking: 'Cook',
+    firemaking: 'FM', woodcutting: 'WC', farming: 'Farm',
+  };
+  function xpDrop(skill, xp) {
+    return ` (+${typeof xp === 'number' && xp % 1 !== 0 ? xp.toFixed(1) : xp} ${SKILL_SHORT[skill] || skill})`;
+  }
+
   // ── Agility course definition ────────────────────────────────────────────
   const AGILITY_COURSES = {
     town_rooftop: {
@@ -39,10 +52,14 @@ module.exports = function registerAll(ctx) {
     },
   };
 
-  // ── Eating food ─────────────────────────────────────────────────────────────
+  // ── Eating food (3-tick delay — feature 5) ─────────────────────────────────
   commands.register('eat', { help: 'Eat food to heal: eat [item]', category: 'Items',
     fn: (p, args) => {
       const name = args.join(' ').toLowerCase();
+      const currentTick = tick.getTick();
+      if (p.nextEatTick && currentTick < p.nextEatTick) {
+        return `You must wait ${p.nextEatTick - currentTick} ticks before eating again.`;
+      }
       const slot = p.inventory.findIndex(s => s && s.name.toLowerCase() === name);
       if (slot < 0) return `You don't have "${name}".`;
       const item = p.inventory[slot];
@@ -52,6 +69,8 @@ module.exports = function registerAll(ctx) {
       p.inventory[slot] = item.count > 1 ? { ...item, count: item.count - 1 } : null;
       const healed = Math.min(heal, p.maxHp - p.hp);
       p.hp += healed;
+      p.nextEatTick = currentTick + 3; // 3-tick eat delay
+      updateWeight(p);
       return `You eat the ${item.name}. HP: ${p.hp}/${p.maxHp} (+${healed})`;
     }
   });
@@ -66,10 +85,56 @@ module.exports = function registerAll(ctx) {
       const xpMap = { 100: 4.5, 106: 15, 107: 72 }; // bones, big bones, dragon bones
       const xp = xpMap[item.id] || 4.5;
       p.inventory[slot] = item.count > 1 ? { ...item, count: item.count - 1 } : null;
+      updateWeight(p);
       const lvl = addXp(p, 'prayer', xp);
-      let msg = `You bury the ${item.name}. +${xp} Prayer XP.`;
+      let msg = `You bury the ${item.name}.${xpDrop('prayer', xp)}`;
       if (lvl) msg += ` Prayer level: ${lvl}!`;
       return msg;
+    }
+  });
+
+  // ── Prayer altar (feature 1) ──────────────────────────────────────────────
+  const BONE_XP = { 100: 4.5, 106: 15, 107: 72 };
+  const ALTAR_MULTIPLIER = 3.5;
+
+  commands.register('pray', { help: 'Toggle prayer, use bones on altar, or restore prayer: pray [name] / pray at altar / pray at', category: 'Combat',
+    fn: (p, args) => {
+      const argStr = args.join(' ').toLowerCase();
+
+      // "pray at altar" — use bones on altar for 3.5x XP
+      if (argStr === 'at altar') {
+        const altar = objects.findObjectByName('altar', p.x, p.y, 3, p.layer);
+        if (!altar) return 'There is no altar nearby.';
+        // Find bones in inventory
+        const slot = p.inventory.findIndex(s => s && s.name.toLowerCase().includes('bone'));
+        if (slot < 0) return 'You have no bones to offer.';
+        const item = p.inventory[slot];
+        const baseXp = BONE_XP[item.id] || 4.5;
+        const xp = Math.floor(baseXp * ALTAR_MULTIPLIER * 10) / 10;
+        p.inventory[slot] = item.count > 1 ? { ...item, count: item.count - 1 } : null;
+        updateWeight(p);
+        const lvl = addXp(p, 'prayer', xp);
+        let msg = `You offer the ${item.name} to the altar.${xpDrop('prayer', xp)}`;
+        if (lvl) msg += ` Prayer level: ${lvl}!`;
+        return msg;
+      }
+
+      // "pray at" — restore prayer points at altar
+      if (argStr === 'at') {
+        const altar = objects.findObjectByName('altar', p.x, p.y, 3, p.layer);
+        if (!altar) return 'There is no altar nearby.';
+        const maxPrayer = getLevel(p, 'prayer');
+        if (p.prayerPoints >= maxPrayer) return 'Your prayer is already full.';
+        p.prayerPoints = maxPrayer;
+        return `You pray at the altar. Prayer points restored to ${p.prayerPoints}/${maxPrayer}.`;
+      }
+
+      // Standard prayer toggle
+      if (!args[0] || args[0] === 'off') { p.activePrayers.clear(); return 'All prayers off.'; }
+      const name = args.join('_').toLowerCase();
+      if (p.activePrayers.has(name)) { p.activePrayers.delete(name); return `${name} off.`; }
+      p.activePrayers.add(name);
+      return `${name} on. Prayer points: ${p.prayerPoints}`;
     }
   });
 
@@ -112,7 +177,7 @@ module.exports = function registerAll(ctx) {
         for (const output of r.outputs) invAdd(pl, output.id, items.get(output.id)?.name || r.name, output.count, items.get(output.id)?.stackable);
         const lvl = addXp(pl, data.skill, r.xp);
         updateWeight(pl);
-        let msg = `You ${data.verb} ${r.name}. +${r.xp} ${data.skill.charAt(0).toUpperCase() + data.skill.slice(1)} XP.`;
+        let msg = `You ${data.verb} ${r.name}.${xpDrop(data.skill, r.xp)}`;
         if (lvl) msg += ` ${data.skill.charAt(0).toUpperCase() + data.skill.slice(1)} level: ${lvl}!`;
         // Can we repeat?
         for (const input of r.inputs) { if (invCount(pl, input.id) < input.count) { actions.cancel(pl); msg += ' You run out of materials.'; } }
@@ -241,7 +306,7 @@ module.exports = function registerAll(ctx) {
       invRemove(p, 273, 5); // fire runes
       invAdd(p, 101, 'Coins', value, true);
       const lvl = addXp(p, 'magic', 65);
-      let msg = `You alch the ${item.name} for ${value} coins. +65 Magic XP.`;
+      let msg = `You alch the ${item.name} for ${value} coins.${xpDrop('magic', 65)}`;
       if (lvl) msg += ` Magic level: ${lvl}!`;
       return msg;
     }
@@ -654,11 +719,11 @@ module.exports = function registerAll(ctx) {
             pl.agilityLap = { courseId: data.course.id, obstaclesDone: new Set() };
           }
           pl.agilityLap.obstaclesDone.add(data.obstacleIdx);
-          let msg = `You cross the ${data.obstacle.name}. +${data.obstacle.xp} Agility XP.`;
+          let msg = `You cross the ${data.obstacle.name}.${xpDrop('agility', data.obstacle.xp)}`;
           if (lvl) msg += ` Agility level: ${lvl}!`;
           if (pl.agilityLap.obstaclesDone.size >= data.course.obstacles.length) {
             const lapLvl = addXp(pl, 'agility', data.course.lapBonus);
-            msg += `\nLap complete! +${data.course.lapBonus} bonus Agility XP.`;
+            msg += `\nLap complete!${xpDrop('agility', data.course.lapBonus)}`;
             if (lapLvl) msg += ` Agility level: ${lapLvl}!`;
             pl.agilityLap = null;
           } else {
@@ -697,7 +762,7 @@ module.exports = function registerAll(ctx) {
         invAdd(p, loot.id, loot.name, count, itemDef?.stackable);
         const lvl = addXp(p, 'thieving', thieving.xp);
         updateWeight(p);
-        let msg = `You pick the ${npc.name}'s pocket. Got: ${loot.name} x${count}. +${thieving.xp} Thieving XP.`;
+        let msg = `You pick the ${npc.name}'s pocket. Got: ${loot.name} x${count}.${xpDrop('thieving', thieving.xp)}`;
         if (lvl) msg += ` Thieving level: ${lvl}!`;
         return msg;
       } else {
@@ -758,6 +823,7 @@ module.exports = function registerAll(ctx) {
         if (p.boosts) for (const [sk, b] of Object.entries(p.boosts)) { if (b.amount < 0) delete p.boosts[sk]; }
         msg += ' Your stats have been restored.';
       } else if (potionName.includes('antipoison')) {
+        p.poison = null;
         msg += ' You have been cured of poison.';
       } else {
         msg += ' Nothing interesting happens.';
@@ -1013,6 +1079,355 @@ module.exports = function registerAll(ctx) {
       if (area) out += `\nArea: ${area.name}`;
 
       return out;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // FARMING (feature 2)
+  // ══════════════════════════════════════════════════════════════════════════
+  const SEED_DATA = {
+    600: { name: 'guam', herbId: 300, herbName: 'Grimy guam', level: 9, xp: 11, stages: 4 },
+    601: { name: 'marrentill', herbId: 301, herbName: 'Grimy marrentill', level: 14, xp: 13.5, stages: 4 },
+    602: { name: 'ranarr', herbId: 304, herbName: 'Grimy ranarr', level: 32, xp: 26.5, stages: 4 },
+  };
+
+  commands.register('plant', { help: 'Plant a seed in a patch: plant [seed] in [patch]', category: 'Skills',
+    fn: (p, args) => {
+      const full = args.join(' ').toLowerCase();
+      const match = full.match(/^(.+?)\s+in\s+(.+)$/);
+      if (!match) return 'Usage: plant [seed] in [patch]. E.g., plant guam seed in herb patch';
+      const seedName = match[1].trim();
+      const patchName = match[2].trim();
+      // Find the patch
+      const obj = objects.findObjectByName(patchName, p.x, p.y, 3, p.layer);
+      if (!obj) return `No "${patchName}" nearby.`;
+      if (obj.defId !== 'herb_patch') return `You can't plant in the ${obj.name}.`;
+      const patchKey = `${obj.layer}_${obj.x}_${obj.y}`;
+      if (!p.farmingPatches) p.farmingPatches = {};
+      if (p.farmingPatches[patchKey] && p.farmingPatches[patchKey].stage < p.farmingPatches[patchKey].maxStage) {
+        return 'Something is already growing in this patch.';
+      }
+      // Find seed
+      const slot = p.inventory.findIndex(s => s && s.name.toLowerCase().includes(seedName));
+      if (slot < 0) return `You don't have any "${seedName}".`;
+      const item = p.inventory[slot];
+      const seedInfo = SEED_DATA[item.id];
+      if (!seedInfo) return `${item.name} is not a plantable seed.`;
+      if (getLevel(p, 'farming') < seedInfo.level) return `You need Farming level ${seedInfo.level}.`;
+      p.inventory[slot] = item.count > 1 ? { ...item, count: item.count - 1 } : null;
+      updateWeight(p);
+      p.farmingPatches[patchKey] = {
+        seedId: item.id, seedName: seedInfo.name, herbId: seedInfo.herbId, herbName: seedInfo.herbName,
+        stage: 0, maxStage: seedInfo.stages, xp: seedInfo.xp, diseased: false,
+      };
+      const lvl = addXp(p, 'farming', seedInfo.xp);
+      let msg = `You plant the ${item.name} in the patch.${xpDrop('farming', seedInfo.xp)}`;
+      if (lvl) msg += ` Farming level: ${lvl}!`;
+      return msg;
+    }
+  });
+
+  commands.register('harvest', { help: 'Harvest a patch: harvest [patch]', category: 'Skills',
+    fn: (p, args) => {
+      const name = args.join(' ').toLowerCase() || 'herb patch';
+      const obj = objects.findObjectByName(name, p.x, p.y, 3, p.layer);
+      if (!obj) return `No "${name}" nearby.`;
+      const patchKey = `${obj.layer}_${obj.x}_${obj.y}`;
+      if (!p.farmingPatches) p.farmingPatches = {};
+      const patch = p.farmingPatches[patchKey];
+      if (!patch) return 'Nothing is planted here.';
+      if (patch.diseased) return 'This patch is diseased! It needs to be cleared. Use `inspect` to see details.';
+      if (patch.stage < patch.maxStage) return `The ${patch.seedName} is still growing (stage ${patch.stage}/${patch.maxStage}).`;
+      if (invFreeSlots(p) < 1) return 'Your inventory is full.';
+      const produce = 3 + Math.floor(Math.random() * 13); // 3-15
+      const itemDef = items.get(patch.herbId);
+      const added = Math.min(produce, invFreeSlots(p));
+      for (let i = 0; i < added; i++) invAdd(p, patch.herbId, patch.herbName, 1);
+      const harvestXp = patch.xp * 5;
+      const lvl = addXp(p, 'farming', harvestXp);
+      updateWeight(p);
+      delete p.farmingPatches[patchKey];
+      let msg = `You harvest ${added}x ${patch.herbName} from the patch.${xpDrop('farming', harvestXp)}`;
+      if (lvl) msg += ` Farming level: ${lvl}!`;
+      return msg;
+    }
+  });
+
+  commands.register('inspect', { help: 'Inspect a farming patch: inspect [patch]', category: 'Skills',
+    fn: (p, args) => {
+      const name = args.join(' ').toLowerCase();
+      // Check if it's a trap check
+      if (name === 'trap' || name === 'traps') {
+        return commands.execute(p, 'checktrap');
+      }
+      if (!name || name === 'herb patch') {
+        // Find nearby herb patches
+        const nearObjs = objects.getObjectsNear(p.x, p.y, 5, p.layer);
+        const patches = nearObjs.filter(o => o.defId === 'herb_patch');
+        if (!patches.length) {
+          // Fall through to examine
+          const npc = npcs.findNpcByName(name, p.x, p.y, 15, p.layer);
+          if (npc) return `${npc.name}: ${npc.examine} (Combat: ${npc.combat})`;
+          const obj = objects.findObjectByName(name, p.x, p.y, 15, p.layer);
+          if (obj) return `${obj.name}: ${obj.examine}`;
+          return 'No herb patches nearby.';
+        }
+        if (!p.farmingPatches) p.farmingPatches = {};
+        let out = 'Farming patches:\n';
+        for (const patch of patches) {
+          const key = `${patch.layer}_${patch.x}_${patch.y}`;
+          const data = p.farmingPatches[key];
+          if (!data) {
+            out += `  ${patch.name} at (${patch.x}, ${patch.y}) — Empty\n`;
+          } else if (data.diseased) {
+            out += `  ${patch.name} at (${patch.x}, ${patch.y}) — ${data.seedName} (DISEASED)\n`;
+          } else if (data.stage >= data.maxStage) {
+            out += `  ${patch.name} at (${patch.x}, ${patch.y}) — ${data.seedName} (Ready to harvest!)\n`;
+          } else {
+            out += `  ${patch.name} at (${patch.x}, ${patch.y}) — ${data.seedName} (stage ${data.stage}/${data.maxStage})\n`;
+          }
+        }
+        return out;
+      }
+      // Default: examine
+      const npc = npcs.findNpcByName(name, p.x, p.y, 15, p.layer);
+      if (npc) return `${npc.name}: ${npc.examine} (Combat: ${npc.combat})`;
+      const obj = objects.findObjectByName(name, p.x, p.y, 15, p.layer);
+      if (obj) return `${obj.name}: ${obj.examine}`;
+      return `Nothing called "${name}" nearby.`;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HUNTER (feature 3)
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('trap', { help: 'Place a trap: trap [bird snare / box trap]', category: 'Skills',
+    fn: (p, args) => {
+      const type = args.join(' ').toLowerCase();
+      if (!type) return 'Usage: trap [bird snare / box trap]';
+      const trapLimit = 1 + Math.floor(getLevel(p, 'hunter') / 20);
+      if (!p.traps) p.traps = [];
+      if (p.traps.length >= trapLimit) return `You can only have ${trapLimit} traps placed (Hunter level ${getLevel(p, 'hunter')}).`;
+
+      if (type === 'bird snare') {
+        const slot = p.inventory.findIndex(s => s && s.id === 610);
+        if (slot < 0) return 'You need a bird snare in your inventory.';
+        p.inventory[slot] = p.inventory[slot].count > 1 ? { ...p.inventory[slot], count: p.inventory[slot].count - 1 } : null;
+        updateWeight(p);
+        p.traps.push({ type: 'bird snare', x: p.x, y: p.y, layer: p.layer, placedTick: tick.getTick(), caught: null, xp: 0 });
+        return `You set up a bird snare at (${p.x}, ${p.y}). Traps: ${p.traps.length}/${trapLimit}`;
+      } else if (type === 'box trap') {
+        if (getLevel(p, 'hunter') < 53) return 'You need Hunter level 53 to use a box trap.';
+        const slot = p.inventory.findIndex(s => s && s.id === 611);
+        if (slot < 0) return 'You need a box trap in your inventory.';
+        p.inventory[slot] = p.inventory[slot].count > 1 ? { ...p.inventory[slot], count: p.inventory[slot].count - 1 } : null;
+        updateWeight(p);
+        p.traps.push({ type: 'box trap', x: p.x, y: p.y, layer: p.layer, placedTick: tick.getTick(), caught: null, xp: 0 });
+        return `You set up a box trap at (${p.x}, ${p.y}). Traps: ${p.traps.length}/${trapLimit}`;
+      }
+      return 'Unknown trap type. Use: bird snare, box trap';
+    }
+  });
+
+  commands.register('checktrap', { help: 'Check your traps for catches', category: 'Skills',
+    fn: (p) => {
+      if (!p.traps || !p.traps.length) return 'You have no traps placed.';
+      let out = 'Your traps:\n';
+      let collectedAny = false;
+      for (let i = p.traps.length - 1; i >= 0; i--) {
+        const trap = p.traps[i];
+        if (trap.caught) {
+          // Collect the catch
+          const lvl = addXp(p, 'hunter', trap.xp);
+          if (trap.type === 'bird snare') {
+            invAdd(p, 612, 'Raw bird meat', 1);
+            invAdd(p, 614, 'Bird feather', 5, true);
+            invAdd(p, 610, 'Bird snare', 1); // return trap
+          } else if (trap.type === 'box trap') {
+            invAdd(p, 613, 'Chinchompa', 1, true);
+            invAdd(p, 611, 'Box trap', 1); // return trap
+          }
+          updateWeight(p);
+          out += `  ${trap.type} at (${trap.x}, ${trap.y}) — Caught ${trap.caught}!${xpDrop('hunter', trap.xp)}`;
+          if (lvl) out += ` Hunter level: ${lvl}!`;
+          out += '\n';
+          p.traps.splice(i, 1);
+          collectedAny = true;
+        } else {
+          const elapsed = tick.getTick() - trap.placedTick;
+          out += `  ${trap.type} at (${trap.x}, ${trap.y}) — Waiting... (${elapsed} ticks)\n`;
+        }
+      }
+      if (collectedAny && p.traps.length === 0) out += 'All traps collected.';
+      return out;
+    }
+  });
+
+  commands.register('check', { help: 'Check trap: check trap', category: 'Skills',
+    fn: (p, args) => {
+      const what = args.join(' ').toLowerCase();
+      if (what === 'trap' || what === 'traps' || what === '') {
+        return commands.execute(p, 'checktrap');
+      }
+      // Fall through to inspect for patches
+      return commands.execute(p, 'inspect ' + what);
+    }
+  });
+
+  commands.register('traps', { help: 'List your active traps', category: 'Skills',
+    fn: (p) => {
+      if (!p.traps || !p.traps.length) return 'You have no traps placed.';
+      const trapLimit = 1 + Math.floor(getLevel(p, 'hunter') / 20);
+      let out = `Traps: ${p.traps.length}/${trapLimit}\n`;
+      for (const trap of p.traps) {
+        const status = trap.caught ? `CAUGHT ${trap.caught}!` : 'waiting...';
+        out += `  ${trap.type} at (${trap.x}, ${trap.y}) — ${status}\n`;
+      }
+      return out;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TELEPORT SPELLS (feature 8)
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('cast', { help: 'Cast a spell: cast [spell name]', category: 'Magic',
+    fn: (p, args) => {
+      const spell = args.join(' ').toLowerCase();
+      if (!spell) return 'Spells: home teleport, varrock teleport, lumbridge teleport';
+
+      if (spell === 'home teleport') {
+        if (p.busy) actions.cancel(p);
+        actions.start(p, {
+          type: 'magic',
+          ticks: 16,
+          repeat: false,
+          data: { player: p },
+          onTick: (data, ticksLeft) => {
+            if (ticksLeft === 15) return 'You begin casting Home Teleport...';
+            if (ticksLeft === 8) return 'The teleport spell builds...';
+            return null;
+          },
+          onComplete: (data) => {
+            const pl = data.player;
+            pl.x = 100; pl.y = 100; pl.layer = 0; pl.path = [];
+            return 'You teleport home to Spawn Island.';
+          },
+        });
+        return 'Casting Home Teleport... (16 ticks, stand still!)';
+      }
+
+      if (spell === 'varrock teleport') {
+        if (getLevel(p, 'magic') < 25) return 'You need Magic level 25.';
+        if (invCount(p, 279) < 1) return 'You need 1 law rune.';
+        if (invCount(p, 270) < 3) return 'You need 3 air runes.';
+        if (invCount(p, 273) < 1) return 'You need 1 fire rune.';
+        if (p.busy) actions.cancel(p);
+        actions.start(p, {
+          type: 'magic',
+          ticks: 3,
+          repeat: false,
+          data: { player: p },
+          onComplete: (data) => {
+            const pl = data.player;
+            invRemove(pl, 279, 1); invRemove(pl, 270, 3); invRemove(pl, 273, 1);
+            const lvl = addXp(pl, 'magic', 35);
+            updateWeight(pl);
+            pl.x = 100; pl.y = 88; pl.layer = 0; pl.path = [];
+            let msg = `You teleport to Town!${xpDrop('magic', 35)}`;
+            if (lvl) msg += ` Magic level: ${lvl}!`;
+            return msg;
+          },
+        });
+        return 'Casting Varrock Teleport...';
+      }
+
+      if (spell === 'lumbridge teleport') {
+        if (getLevel(p, 'magic') < 31) return 'You need Magic level 31.';
+        if (invCount(p, 279) < 1) return 'You need 1 law rune.';
+        if (invCount(p, 270) < 3) return 'You need 3 air runes.';
+        if (invCount(p, 272) < 1) return 'You need 1 earth rune.';
+        if (p.busy) actions.cancel(p);
+        actions.start(p, {
+          type: 'magic',
+          ticks: 3,
+          repeat: false,
+          data: { player: p },
+          onComplete: (data) => {
+            const pl = data.player;
+            invRemove(pl, 279, 1); invRemove(pl, 270, 3); invRemove(pl, 272, 1);
+            const lvl = addXp(pl, 'magic', 41);
+            updateWeight(pl);
+            pl.x = 100; pl.y = 100; pl.layer = 0; pl.path = [];
+            let msg = `You teleport to Lumbridge!${xpDrop('magic', 41)}`;
+            if (lvl) msg += ` Magic level: ${lvl}!`;
+            return msg;
+          },
+        });
+        return 'Casting Lumbridge Teleport...';
+      }
+
+      return `Unknown spell: "${spell}". Spells: home teleport, varrock teleport, lumbridge teleport`;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // EXAMINE SELF (feature 12)
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('examine', { help: 'Examine something: examine [target] or examine self', category: 'World',
+    fn: (p, args) => {
+      const name = args.join(' ').toLowerCase();
+      if (!name) return 'Usage: examine [target] or examine self';
+
+      if (name === 'self' || name === 'me' || name === 'myself') {
+        const cb = combatLevel(p);
+        const tl = totalLevel(p);
+        let totalXp = 0;
+        const { SKILLS } = require('../player/player');
+        for (const s of SKILLS) totalXp += getXp(p, s);
+        const ticksPlayed = tick.getTick() - (p.loginTick || 0);
+        const secondsPlayed = Math.floor(ticksPlayed * 0.6);
+        const minutesPlayed = Math.floor(secondsPlayed / 60);
+
+        // Bank value estimate
+        let bankValue = 0;
+        if (p.bank) {
+          for (const b of p.bank) {
+            const def = items.get(b.id);
+            bankValue += (def?.value || 0) * (b.count || 1);
+          }
+        }
+
+        let out = `══ ${p.name} ══\n`;
+        out += `Combat Level: ${cb} | Total Level: ${tl}\n`;
+        out += `HP: ${p.hp}/${p.maxHp} | Prayer: ${p.prayerPoints}/${getLevel(p, 'prayer')}\n\n`;
+        out += '── Skills ──\n';
+        // Format in 2 columns
+        for (let i = 0; i < SKILLS.length; i += 2) {
+          const s1 = SKILLS[i];
+          const l1 = getLevel(p, s1);
+          const col1 = `${s1.padEnd(14)} ${String(l1).padStart(3)}`;
+          if (i + 1 < SKILLS.length) {
+            const s2 = SKILLS[i + 1];
+            const l2 = getLevel(p, s2);
+            const col2 = `${s2.padEnd(14)} ${String(l2).padStart(3)}`;
+            out += `  ${col1}  |  ${col2}\n`;
+          } else {
+            out += `  ${col1}\n`;
+          }
+        }
+        out += `\nTotal XP: ${totalXp.toLocaleString()}`;
+        out += `\nQuest Points: ${(require('../data/quests')).getQuestPoints(p)}`;
+        out += `\nBank Value: ~${bankValue.toLocaleString()} coins`;
+        out += `\nTime Played: ${minutesPlayed} minutes (${ticksPlayed} ticks)`;
+        return out;
+      }
+
+      // Standard examine
+      const npc = npcs.findNpcByName(name, p.x, p.y, 15, p.layer);
+      if (npc) return `${npc.name}: ${npc.examine} (Combat: ${npc.combat})`;
+      const obj = objects.findObjectByName(name, p.x, p.y, 15, p.layer);
+      if (obj) return `${obj.name}: ${obj.examine}`;
+      return `Nothing called "${name}" nearby.`;
     }
   });
 };

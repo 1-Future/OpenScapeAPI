@@ -37,6 +37,8 @@ define({ id: 'smith_steel_scimitar', skill: 'smithing', name: 'Steel scimitar', 
 define({ id: 'smith_mithril_scimitar', skill: 'smithing', name: 'Mithril scimitar', inputs: [{ id: 254, count: 2 }], outputs: [{ id: 430, count: 1 }], level: 55, xp: 100, ticks: 3, station: 'anvil', tool: 'hammer' });
 define({ id: 'smith_adamant_scimitar', skill: 'smithing', name: 'Adamant scimitar', inputs: [{ id: 255, count: 2 }], outputs: [{ id: 440, count: 1 }], level: 75, xp: 125, ticks: 3, station: 'anvil', tool: 'hammer' });
 define({ id: 'smith_rune_scimitar', skill: 'smithing', name: 'Rune scimitar', inputs: [{ id: 256, count: 2 }], outputs: [{ id: 450, count: 1 }], level: 90, xp: 150, ticks: 3, station: 'anvil', tool: 'hammer' });
+define({ id: 'smith_bronze_arrowheads', skill: 'smithing', name: 'Bronze arrowheads', inputs: [{ id: 250, count: 1 }], outputs: [{ id: 593, count: 15 }], level: 5, xp: 12, ticks: 3, station: 'anvil', tool: 'hammer' });
+define({ id: 'smith_iron_arrowheads', skill: 'smithing', name: 'Iron arrowheads', inputs: [{ id: 251, count: 1 }], outputs: [{ id: 594, count: 15 }], level: 20, xp: 25, ticks: 3, station: 'anvil', tool: 'hammer' });
 
 // ── Crafting ──────────────────────────────────────────────────────────────────
 define({ id: 'tan_cowhide', skill: 'crafting', name: 'Leather', inputs: [{ id: 102, count: 1 }], outputs: [{ id: 108, count: 1 }], level: 1, xp: 0, ticks: 2, station: 'tanner' });
@@ -53,6 +55,8 @@ define({ id: 'fletch_shortbow_u', skill: 'fletching', name: 'Shortbow (u)', inpu
 define({ id: 'fletch_shortbow', skill: 'fletching', name: 'Shortbow', inputs: [{ id: 590, count: 1 }, { id: 580, count: 1 }], outputs: [{ id: 350, count: 1 }], level: 5, xp: 5, ticks: 2 });
 define({ id: 'fletch_oak_shortbow_u', skill: 'fletching', name: 'Oak shortbow (u)', inputs: [{ id: 201, count: 1 }], outputs: [{ id: 591, count: 1 }], level: 20, xp: 16, ticks: 3, tool: 'knife' });
 define({ id: 'fletch_oak_shortbow', skill: 'fletching', name: 'Oak shortbow', inputs: [{ id: 591, count: 1 }, { id: 580, count: 1 }], outputs: [{ id: 351, count: 1 }], level: 20, xp: 16, ticks: 2 });
+define({ id: 'fletch_bronze_arrows', skill: 'fletching', name: 'Bronze arrows', inputs: [{ id: 341, count: 15 }, { id: 593, count: 15 }], outputs: [{ id: 342, count: 15 }], level: 1, xp: 20, ticks: 2 });
+define({ id: 'fletch_iron_arrows', skill: 'fletching', name: 'Iron arrows', inputs: [{ id: 341, count: 15 }, { id: 594, count: 15 }], outputs: [{ id: 343, count: 15 }], level: 15, xp: 37, ticks: 2 });
 
 // ── Herblore ──────────────────────────────────────────────────────────────────
 define({ id: 'clean_guam', skill: 'herblore', name: 'Clean guam', inputs: [{ id: 300, count: 1 }], outputs: [{ id: 310, count: 1 }], level: 3, xp: 2, ticks: 1 });

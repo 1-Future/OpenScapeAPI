@@ -79,6 +79,19 @@ function endSessionLog(ws) {
   sessionLogs.delete(ws);
 }
 
+// ── XP drop helper (feature 11) ──────────────────────────────────────────────
+const SKILL_SHORT = {
+  attack: 'Att', strength: 'Str', defence: 'Def', hitpoints: 'HP',
+  ranged: 'Range', prayer: 'Prayer', magic: 'Magic', runecrafting: 'RC',
+  construction: 'Con', agility: 'Agil', herblore: 'Herb', thieving: 'Thieving',
+  crafting: 'Craft', fletching: 'Fletch', slayer: 'Slay', hunter: 'Hunter',
+  mining: 'Mining', smithing: 'Smith', fishing: 'Fish', cooking: 'Cook',
+  firemaking: 'FM', woodcutting: 'WC', farming: 'Farm',
+};
+function xpDrop(skill, xp) {
+  return ` (+${typeof xp === 'number' && xp % 1 !== 0 ? xp.toFixed(1) : xp} ${SKILL_SHORT[skill] || skill})`;
+}
+
 // ── Helper ────────────────────────────────────────────────────────────────────
 function send(ws, msg) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -112,8 +125,10 @@ function movementTick(currentTick) {
       const step2 = p.path.shift();
       p.x = step2.x;
       p.y = step2.y;
-      // Drain energy: 67 + (67 × weight/64)
-      const drain = Math.floor(67 + (67 * Math.max(0, p.weight) / 64));
+      // Recalculate weight to ensure accuracy (feature 4)
+      calcWeight(p, (id) => items.get(id));
+      // Drain energy: 67 + floor(67 × weight / 64) per tile while running
+      const drain = 67 + Math.floor(67 * Math.max(0, p.weight) / 64);
       p.runEnergy = Math.max(0, p.runEnergy - drain);
       if (p.runEnergy <= 0) {
         p.running = false;
@@ -274,7 +289,14 @@ function combatTick(currentTick) {
         const npcHit = Math.random() < 0.5;
         const npcDmg = npcHit ? Math.floor(Math.random() * (npc.maxHit + 1)) : 0;
         p.hp = Math.max(0, p.hp - npcDmg);
-        if (npcDmg > 0) sendText(ws, `The ${npc.name} hits you for ${npcDmg} damage. HP: ${p.hp}/${p.maxHp}`);
+        if (npcDmg > 0) {
+          sendText(ws, `The ${npc.name} hits you for ${npcDmg} damage. HP: ${p.hp}/${p.maxHp}`);
+          // Poison check (feature 6)
+          if (npc.poisonDamage && npc.poisonDamage > 0 && !p.poison && Math.random() < 0.25) {
+            p.poison = { damage: npc.poisonDamage };
+            sendText(ws, `You have been poisoned!`);
+          }
+        }
         if (p.hp <= 0) {
           actions.cancel(p);
           // Death: keep 3 most valuable items, drop the rest
@@ -325,8 +347,40 @@ function combatTick(currentTick) {
 
 // ── World Tick ────────────────────────────────────────────────────────────────
 function worldTick(currentTick) {
+  // Track what was dead/depleted before tick for respawn messages
+  const wasDeadNpcs = [];
+  for (const npc of npcs.npcs.values()) {
+    if (npc.dead && currentTick >= npc.respawnAt) wasDeadNpcs.push(npc);
+  }
+  const wasDepleted = [];
+  for (const obj of objects.objects.values()) {
+    if (obj.depleted && currentTick >= obj.respawnAt) wasDepleted.push(obj);
+  }
+
   npcs.npcTick(currentTick);
   objects.objectTick(currentTick);
+
+  // Monster respawn messages (feature 10)
+  for (const npc of wasDeadNpcs) {
+    if (!npc.dead) { // It respawned
+      for (const [ws, p] of players) {
+        if (Math.abs(p.x - npc.x) <= 10 && Math.abs(p.y - npc.y) <= 10 && p.layer === npc.layer) {
+          sendText(ws, `A ${npc.name} appears.`);
+        }
+      }
+    }
+  }
+  // Resource respawn messages (feature 10)
+  for (const obj of wasDepleted) {
+    if (!obj.depleted) { // It respawned
+      for (const [ws, p] of players) {
+        if (Math.abs(p.x - obj.x) <= 10 && Math.abs(p.y - obj.y) <= 10 && p.layer === obj.layer) {
+          const type = obj.skill === 'mining' ? 'rock' : obj.skill === 'woodcutting' ? 'tree' : obj.name.toLowerCase();
+          sendText(ws, `The ${type} is ready to harvest again.`);
+        }
+      }
+    }
+  }
 
   // Process tick-based actions (gathering, processing)
   const actionMsgs = actions.processTick();
@@ -394,6 +448,106 @@ function worldTick(currentTick) {
       if (p.prayerPoints <= 0) {
         p.activePrayers.clear();
         sendText(ws, 'You have run out of prayer points.');
+      }
+    }
+  }
+
+  // Poison tick (every 20 ticks)
+  if (currentTick % 20 === 0) {
+    for (const [ws, p] of players) {
+      if (p.poison && p.poison.damage > 0) {
+        const dmg = p.poison.damage;
+        p.hp = Math.max(0, p.hp - dmg);
+        sendText(ws, `You are poisoned! ${dmg} damage. HP: ${p.hp}/${p.maxHp}`);
+        p.poison.damage = Math.max(0, p.poison.damage - 1);
+        if (p.poison.damage <= 0) {
+          p.poison = null;
+          sendText(ws, 'The poison has worn off.');
+        }
+        if (p.hp <= 0) {
+          sendText(ws, 'Oh dear, you are dead! Killed by poison.');
+          p.hp = p.maxHp; p.x = SPAWN_X; p.y = SPAWN_Y; p.layer = 0;
+          p.combatTarget = null; p.busy = false; p.path = [];
+          p.prayerPoints = getLevel(p, 'prayer'); p.activePrayers.clear();
+          p.runEnergy = 10000; p.poison = null;
+        }
+      }
+    }
+  }
+
+  // NPC aggression tick
+  for (const [ws, p] of players) {
+    if (p.combatTarget || p.pvpTarget || p.hp <= 0) continue;
+    const nearNpcs = npcs.getNpcsNear(p.x, p.y, 8, p.layer);
+    for (const npc of nearNpcs) {
+      if (!npc.aggressive || npc.dead || npc.target || npc.combat === 0) continue;
+      const dist = Math.max(Math.abs(npc.x - p.x), Math.abs(npc.y - p.y));
+      if (dist > npc.aggroRange) continue;
+      // Check 10 minute (1000 tick) aggro timer
+      if (!p.aggroTimers) p.aggroTimers = {};
+      const timerKey = `${npc.defId}_${Math.floor(npc.spawnX / 20)}_${Math.floor(npc.spawnY / 20)}`;
+      if (!p.aggroTimers[timerKey]) p.aggroTimers[timerKey] = currentTick;
+      if (currentTick - p.aggroTimers[timerKey] > 1000) continue; // Aggro expired
+      // Start attacking
+      npc.target = p.id;
+      p.combatTarget = npc.id;
+      p.busy = true;
+      sendText(ws, `The ${npc.name} attacks you!`);
+      break; // Only one NPC aggros at a time
+    }
+  }
+
+  // Farming tick (growth every 500 ticks = ~5 min)
+  if (currentTick % 500 === 0) {
+    for (const [ws, p] of players) {
+      if (!p.farmingPatches) continue;
+      for (const [key, patch] of Object.entries(p.farmingPatches)) {
+        if (!patch || patch.stage >= patch.maxStage) continue;
+        // Disease chance (10% per stage)
+        if (!patch.diseased && Math.random() < 0.1) {
+          patch.diseased = true;
+          continue;
+        }
+        if (patch.diseased) continue; // Diseased patches don't grow
+        patch.stage++;
+        if (patch.stage >= patch.maxStage) {
+          // Notify player if nearby
+          const [layer, x, y] = key.split('_').map(Number);
+          if (Math.abs(p.x - x) <= 15 && Math.abs(p.y - y) <= 15 && p.layer === layer) {
+            sendText(ws, `Your ${patch.seedName} patch is fully grown and ready to harvest!`);
+          }
+        }
+      }
+    }
+  }
+
+  // Hunter trap check (every 50 ticks)
+  if (currentTick % 50 === 0) {
+    for (const [ws, p] of players) {
+      if (!p.traps || !p.traps.length) continue;
+      for (const trap of p.traps) {
+        if (trap.caught) continue;
+        let catchChance = 0;
+        let catchName = '';
+        let xp = 0;
+        if (trap.type === 'bird snare') {
+          catchChance = 0.3 + getLevel(p, 'hunter') * 0.005;
+          catchName = 'a bird';
+          xp = 34;
+        } else if (trap.type === 'box trap') {
+          if (getLevel(p, 'hunter') < 53) continue;
+          catchChance = 0.2 + (getLevel(p, 'hunter') - 53) * 0.005;
+          catchName = 'a chinchompa';
+          xp = 198;
+        }
+        if (Math.random() < catchChance) {
+          trap.caught = catchName;
+          trap.xp = xp;
+          // Notify if nearby
+          if (Math.abs(p.x - trap.x) <= 15 && Math.abs(p.y - trap.y) <= 15 && p.layer === trap.layer) {
+            sendText(ws, `Your ${trap.type} at (${trap.x}, ${trap.y}) has caught something!`);
+          }
+        }
       }
     }
   }
@@ -638,15 +792,7 @@ commands.register('retaliate', { help: 'Toggle auto-retaliate', category: 'Comba
   fn: (p) => { p.autoRetaliate = !p.autoRetaliate; return `Auto-retaliate: ${p.autoRetaliate ? 'ON' : 'OFF'}`; }
 });
 
-commands.register('pray', { help: 'Toggle prayer: pray [name] or pray off', category: 'Combat',
-  fn: (p, args) => {
-    if (!args[0] || args[0] === 'off') { p.activePrayers.clear(); return 'All prayers off.'; }
-    const name = args.join('_').toLowerCase();
-    if (p.activePrayers.has(name)) { p.activePrayers.delete(name); return `${name} off.`; }
-    p.activePrayers.add(name);
-    return `${name} on. Prayer points: ${p.prayerPoints}`;
-  }
-});
+// pray command registered in commands/all.js (includes altar support)
 
 // Skills
 commands.register('skills', { help: 'Show all skills', aliases: ['stats'], category: 'Skills',
@@ -786,17 +932,7 @@ commands.register('talk', { help: 'Talk to an NPC: talk [name]', category: 'Worl
   }
 });
 
-commands.register('examine', { help: 'Examine something: examine [target]', aliases: ['inspect'], category: 'World',
-  fn: (p, args) => {
-    const name = args.join(' ').toLowerCase();
-    if (!name) return 'Usage: examine [target]';
-    const npc = npcs.findNpcByName(name, p.x, p.y, 15, p.layer);
-    if (npc) return `${npc.name}: ${npc.examine} (Combat: ${npc.combat})`;
-    const obj = objects.findObjectByName(name, p.x, p.y, 15, p.layer);
-    if (obj) return `${obj.name}: ${obj.examine}`;
-    return `Nothing called "${name}" nearby.`;
-  }
-});
+// examine command registered in commands/all.js (includes examine self)
 
 // ── Gathering (tick-based) ─────────────────────────────────────────────────────
 function startGathering(p, ws, skillName, verb, obj) {
@@ -833,7 +969,7 @@ function startGathering(p, ws, skillName, verb, obj) {
         data.obj.respawnAt = tick.getTick() + data.obj.respawnTicks;
         actions.cancel(data.player);
       }
-      let msg = `You get some ${data.obj.product?.name || 'resources'}. +${data.obj.xp} ${data.skillName} XP.`;
+      let msg = `You get some ${data.obj.product?.name || 'resources'}.${xpDrop(data.skillName, data.obj.xp)}`;
       if (lvl) msg += ` ${data.skillName} level: ${lvl}!`;
       if (data.obj.depleted) msg += ` The ${data.obj.name} is depleted.`;
       return msg;
@@ -1292,7 +1428,7 @@ function createDefaultContent() {
   const T = tiles.T;
 
   // ── NPC Definitions ────────────────────────────────────────────────────────
-  npcs.defineNpc('goblin', { name: 'Goblin', examine: 'An ugly green creature.', combat: 2, maxHp: 5, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 4, wanderRadius: 4, respawnTicks: 25,
+  npcs.defineNpc('goblin', { name: 'Goblin', examine: 'An ugly green creature.', combat: 2, maxHp: 5, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 4, aggressive: true, aggroRange: 3, wanderRadius: 4, respawnTicks: 25,
     drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 8, min: 1, max: 5 }],
     thieving: { level: 1, xp: 10, loot: [{ id: 101, name: 'Coins', min: 1, max: 5 }], stunDamage: 1 }
   });
@@ -1327,11 +1463,11 @@ function createDefaultContent() {
     drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 20, max: 60 }],
     thieving: { level: 55, xp: 84, loot: [{ id: 101, name: 'Coins', min: 30, max: 80 }], stunDamage: 3 }
   });
-  npcs.defineNpc('hill_giant', { name: 'Hill Giant', examine: 'A very large humanoid.', combat: 28, maxHp: 35, stats: { attack: 18, strength: 22, defence: 26, def_slash: 18 }, maxHit: 4, attackSpeed: 4, wanderRadius: 4, respawnTicks: 30,
+  npcs.defineNpc('hill_giant', { name: 'Hill Giant', examine: 'A very large humanoid.', combat: 28, maxHp: 35, stats: { attack: 18, strength: 22, defence: 26, def_slash: 18 }, maxHit: 4, attackSpeed: 4, aggressive: true, aggroRange: 4, wanderRadius: 4, respawnTicks: 30,
     drops: [{ id: 106, name: 'Big bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 10, max: 50 }] });
   npcs.defineNpc('lesser_demon', { name: 'Lesser Demon', examine: 'A demon from the underworld.', combat: 82, maxHp: 79, stats: { attack: 68, strength: 67, defence: 71, def_slash: 42 }, maxHit: 8, attackSpeed: 4, wanderRadius: 3, respawnTicks: 30,
     drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }] });
-  npcs.defineNpc('green_dragon', { name: 'Green Dragon', examine: 'A green dragon.', combat: 79, maxHp: 75, stats: { attack: 68, strength: 66, defence: 64, def_slash: 40 }, maxHit: 8, attackSpeed: 4, wanderRadius: 3, respawnTicks: 40,
+  npcs.defineNpc('green_dragon', { name: 'Green Dragon', examine: 'A green dragon.', combat: 79, maxHp: 75, stats: { attack: 68, strength: 66, defence: 64, def_slash: 40 }, maxHit: 8, attackSpeed: 4, aggressive: true, aggroRange: 5, wanderRadius: 3, respawnTicks: 40, poisonDamage: 4,
     drops: [{ id: 107, name: 'Dragon bones', weight: 10, min: 1, max: 1 }] });
   npcs.defineNpc('moss_giant', { name: 'Moss Giant', examine: 'A large moss-covered humanoid.', combat: 42, maxHp: 60, stats: { attack: 30, strength: 30, defence: 30, def_slash: 20 }, maxHit: 5, attackSpeed: 4, wanderRadius: 4, respawnTicks: 30,
     drops: [{ id: 106, name: 'Big bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 20, max: 80 }] });
@@ -1344,6 +1480,7 @@ function createDefaultContent() {
   npcs.defineNpc('greater_demon', { name: 'Greater Demon', examine: 'A powerful demon.', combat: 92, maxHp: 87, stats: { attack: 78, strength: 80, defence: 75, def_slash: 50 }, maxHit: 10, aggressive: true, aggroRange: 5, attackSpeed: 4, wanderRadius: 3, respawnTicks: 35,
     drops: [{ id: 100, name: 'Bones', weight: 10, min: 1, max: 1 }, { id: 101, name: 'Coins', weight: 6, min: 30, max: 100 }] });
   npcs.defineNpc('giant_spider', { name: 'Giant Spider', examine: 'A very large spider.', combat: 2, maxHp: 4, stats: { attack: 1, strength: 1, defence: 1 }, maxHit: 1, attackSpeed: 4, wanderRadius: 5, respawnTicks: 15, drops: [] });
+  npcs.defineNpc('poison_spider', { name: 'Poison Spider', examine: 'A venomous spider.', combat: 64, maxHp: 56, stats: { attack: 50, strength: 48, defence: 44, def_slash: 30 }, maxHit: 6, attackSpeed: 4, aggressive: true, aggroRange: 4, wanderRadius: 4, respawnTicks: 25, poisonDamage: 5, drops: [] });
   npcs.defineNpc('scorpion', { name: 'Scorpion', examine: 'A dangerous scorpion.', combat: 14, maxHp: 17, stats: { attack: 10, strength: 8, defence: 8 }, maxHit: 2, aggressive: true, aggroRange: 3, attackSpeed: 4, wanderRadius: 3, respawnTicks: 20, drops: [] });
 
   // Shop/NPC definitions
@@ -1387,6 +1524,8 @@ function createDefaultContent() {
   objects.defineObject('agility_rooftop', { name: 'Rooftop edge', examine: 'A roof edge to cross.' });
   objects.defineObject('agility_gap', { name: 'Gap', examine: 'A gap to jump across.' });
   objects.defineObject('agility_ladder', { name: 'Ladder', examine: 'A ladder to climb.' });
+  objects.defineObject('altar', { name: 'Altar', examine: 'An altar for prayer.', actions: ['pray'] });
+  objects.defineObject('herb_patch', { name: 'Herb patch', examine: 'A patch for growing herbs.', actions: ['plant', 'harvest', 'inspect'] });
 
   // ── Helper functions ───────────────────────────────────────────────────────
   function fillArea(x1, y1, x2, y2, tile) {
@@ -1475,6 +1614,9 @@ function createDefaultContent() {
   npcs.spawnNpc('knight', 114, 85);
   npcs.spawnNpc('guard', 95, 85);
   npcs.spawnNpc('guard', 112, 85);
+  // Altars in town
+  objects.placeObject('altar', 114, 82);
+  objects.placeObject('altar', 114, 83);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // LUMBRIDGE FIELDS (75-90, 95-115) — cows, chickens, wheat
@@ -1488,6 +1630,10 @@ function createDefaultContent() {
   fillArea(76, 105, 85, 113, T.FLOWER);
   for (let x = 77; x <= 84; x += 2) for (let y = 106; y <= 112; y += 2) objects.placeObject('wheat', x, y);
   npcs.spawnNpc('farmer', 80, 110); npcs.spawnNpc('farmer', 84, 108);
+  // Herb patches near the farm area
+  objects.placeObject('herb_patch', 78, 102);
+  objects.placeObject('herb_patch', 80, 102);
+  objects.placeObject('herb_patch', 82, 102);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // FOREST (70-90, 70-95) — normal, oak, willow, maple, yew trees
@@ -1505,6 +1651,15 @@ function createDefaultContent() {
   tiles.setTile(71, 75, T.TREE); objects.placeObject('yew', 71, 75);
   tiles.setTile(73, 90, T.TREE); objects.placeObject('yew', 73, 90);
   npcs.spawnNpc('giant_spider', 75, 75); npcs.spawnNpc('giant_spider', 82, 78); npcs.spawnNpc('giant_spider', 78, 85);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HUNTING GROUNDS (91-105, 70-80) — east of forest
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(91, 70, 105, 79, T.GRASS);
+  tiles.defineArea('hunting_grounds', { name: 'Hunting Grounds', x1: 91, y1: 70, x2: 105, y2: 79 });
+  // Connect hunting grounds to town/forest
+  widePath(95, 80, 95, 79);
+  widePath(91, 75, 90, 75);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MINING SITE (115-130, 100-115) — copper, tin, iron, coal, gold, mithril
@@ -1578,6 +1733,7 @@ function createDefaultContent() {
   npcs.spawnNpc('dark_wizard', 110, 46); npcs.spawnNpc('dark_wizard', 115, 50);
   npcs.spawnNpc('greater_demon', 100, 42); npcs.spawnNpc('lesser_demon', 120, 44);
   npcs.spawnNpc('green_dragon', 130, 45); npcs.spawnNpc('green_dragon', 135, 48);
+  npcs.spawnNpc('poison_spider', 88, 48); npcs.spawnNpc('poison_spider', 92, 46);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PATH NETWORK — connect all areas with continuous walkable tiles

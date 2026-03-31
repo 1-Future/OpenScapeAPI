@@ -91,6 +91,17 @@ function createPlayer(id, name) {
     stunTicks: 0,
     // Agility lap tracking: { courseId, obstaclesDone: Set }
     agilityLap: null,
+
+    // Poison: { damage, ticksUntilNext }
+    poison: null,
+    // Eat delay: tick when player can next eat
+    nextEatTick: 0,
+    // Hunter traps: [{ type, x, y, layer, placedTick, catches }]
+    traps: [],
+    // Farming patches: Map-like — stored as object { "layer_x_y": { seed, stage, growthTick, diseased } }
+    farmingPatches: {},
+    // Aggro timer: { "npcDefId": firstSeenTick } — tracks when NPCs first noticed this player
+    aggroTimers: {},
   };
 }
 

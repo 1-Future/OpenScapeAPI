@@ -273,4 +273,22 @@ define({ id: 590, name: 'Shortbow (u)', examine: 'An unstrung shortbow.', value:
 define({ id: 591, name: 'Oak shortbow (u)', examine: 'An unstrung oak shortbow.', value: 40, category: 'fletching', weight: 0.9 });
 define({ id: 592, name: 'Willow shortbow (u)', examine: 'An unstrung willow shortbow.', value: 80, category: 'fletching', weight: 0.9 });
 
+// Arrowheads
+define({ id: 593, name: 'Bronze arrowheads', examine: 'Bronze arrowheads.', stackable: true, value: 2, category: 'fletching', weight: 0 });
+define({ id: 594, name: 'Iron arrowheads', examine: 'Iron arrowheads.', stackable: true, value: 5, category: 'fletching', weight: 0 });
+
+// Seeds (farming)
+define({ id: 600, name: 'Guam seed', examine: 'A guam seed.', stackable: true, value: 5, category: 'farming', weight: 0 });
+define({ id: 601, name: 'Marrentill seed', examine: 'A marrentill seed.', stackable: true, value: 8, category: 'farming', weight: 0 });
+define({ id: 602, name: 'Ranarr seed', examine: 'A ranarr seed.', stackable: true, value: 100, category: 'farming', weight: 0 });
+
+// Hunter items
+define({ id: 610, name: 'Bird snare', examine: 'A bird snare for catching birds.', value: 20, category: 'hunter', weight: 0.5 });
+define({ id: 611, name: 'Box trap', examine: 'A box trap for catching chinchompas.', value: 40, category: 'hunter', weight: 1 });
+define({ id: 612, name: 'Raw bird meat', examine: 'Raw bird meat.', value: 5, category: 'cooking', weight: 0.3 });
+define({ id: 613, name: 'Chinchompa', examine: 'A chinchompa.', stackable: true, value: 200, category: 'hunter', weight: 0 });
+define({ id: 614, name: 'Bird feather', examine: 'A colourful bird feather.', stackable: true, value: 10, category: 'hunter', weight: 0 });
+
+// Antipoison potion (already exists as id 333 — Antipoison(4))
+
 module.exports = { define, get, find, search, items, FOOD_HEAL };
