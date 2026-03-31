@@ -144,6 +144,37 @@ function createPlayer(id, name) {
 
     // ── Friends list ──
     friends: [],
+
+    // ── Player-Owned House (construction) ──
+    house: [], // [{ type, furniture: { hotspot: furnitureId } }]
+    houseLocation: null, // { x, y, layer } — saved position before entering house
+
+    // ── Boss KC ──
+    bossKills: {}, // { "king_black_dragon": 5, ... }
+
+    // ── Treasure Trails (clue scrolls) ──
+    activeClue: null, // { tier, steps, currentStep, stepData }
+
+    // ── Duel Arena ──
+    duelWins: 0,
+    duelLosses: 0,
+    duelChallenge: null, // { from, rules }
+    inDuel: false,
+
+    // ── Music system ──
+    unlockedTracks: [], // ["Harmony", "Newbie Melody", ...]
+    currentTrack: null,
+
+    // ── Bounty Hunter ──
+    bhTarget: null, // player id
+    bhKills: 0,
+    bhDeaths: 0,
+    bhEmblemTier: 0,
+
+    // ── Achievement Diary ──
+    diaryProgress: {}, // { "lumbridge_easy": { chop_tree: true, ... } }
+    diaryComplete: {}, // { "lumbridge_easy": true }
+    diaryRewards: {}, // { "lumbridge_easy": true }
   };
 }
 

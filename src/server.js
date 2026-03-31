@@ -148,6 +148,31 @@ function movementTick(currentTick) {
     if (actions.isActive(p)) actions.cancel(p);
     events.emit('player_move', { player: p, ws });
 
+    // ── Music system: unlock tracks on area entry ──
+    const moveArea = tiles.getArea(p.x, p.y, p.layer);
+    if (moveArea) {
+      const trackMap = {
+        spawn: 'Newbie Melody', town: 'Harmony', fields: 'Autumn Voyage',
+        forest: 'Flute Salad', hunting_grounds: 'Country Jig', mines: 'Dwarven Domain',
+        dock: 'Sea Shanty 2', goblin_village: 'Goblin Game', giant_plains: 'Scape Main',
+        wilderness_border: 'Wilderness', wilderness: 'Dark Wilderness',
+        kbd_lair: 'Dragon Slayer', mole_den: 'Subterranea', barrows: 'Barrows',
+        duel_arena: 'Duel Arena', air_altar: 'Rune Essence',
+        water_altar: 'Waterfall', earth_altar: 'Crystal Cave', fire_altar: 'Volcanic',
+      };
+      const track = trackMap[moveArea.id];
+      if (track) {
+        if (!p.unlockedTracks) p.unlockedTracks = [];
+        if (!p.unlockedTracks.includes(track)) {
+          p.unlockedTracks.push(track);
+          sendText(ws, `Music unlocked: ${track}`);
+        }
+        if (p.currentTrack !== track) {
+          p.currentTrack = track;
+        }
+      }
+    }
+
     // Check wilderness entry
     if (p.y <= 55) {
       const wildyLevel = 55 - p.y;
@@ -290,6 +315,14 @@ function combatTick(currentTick) {
       p.killCounts[kcKey] = (p.killCounts[kcKey] || 0) + 1;
       events.emit('npc_kill', { player: p, ws, npc, killCount: p.killCounts[kcKey] });
 
+      // ── Boss KC tracking ──
+      const BOSS_IDS = ['king_black_dragon', 'giant_mole', 'dharok', 'verac', 'guthan', 'ahrim', 'karil', 'torag'];
+      if (BOSS_IDS.includes(npc.defId)) {
+        if (!p.bossKills) p.bossKills = {};
+        p.bossKills[npc.defId] = (p.bossKills[npc.defId] || 0) + 1;
+        msg += `\n  Boss KC: ${npc.name} — ${p.bossKills[npc.defId]}`;
+      }
+
       // Drop loot (use drop tables if defined, fallback to NPC inline drops)
       const drops = droptables.tables.has(npc.defId) ? droptables.roll(npc.defId) : npcs.rollDrops(npc);
       for (const drop of drops) {
@@ -356,16 +389,83 @@ function combatTick(currentTick) {
       npc.target = p.id;
       if (currentTick >= npc.nextAttackTick) {
         npc.nextAttackTick = currentTick + npc.attackSpeed;
-        const npcHit = Math.random() < 0.5;
-        const npcDmg = npcHit ? Math.floor(Math.random() * (npc.maxHit + 1)) : 0;
+
+        // ── Boss special mechanics ──
+        let npcDmg = 0;
+        let npcHit = false;
+        let bossMsg = '';
+
+        if (npc.defId === 'king_black_dragon') {
+          // KBD phases at 170/85/0 HP, dragonfire every 5 ticks
+          if (!npc._phase) npc._phase = 1;
+          if (npc.hp <= 85 && npc._phase < 3) { npc._phase = 3; bossMsg += ` The KBD enters its final phase!`; }
+          else if (npc.hp <= 170 && npc._phase < 2) { npc._phase = 2; bossMsg += ` The KBD grows more aggressive!`; }
+          // Dragonfire every 5 ticks
+          if (!npc._dragonfireTick) npc._dragonfireTick = 0;
+          if (currentTick - npc._dragonfireTick >= 5) {
+            npc._dragonfireTick = currentTick;
+            const hasShield = p.equipment.shield && p.equipment.shield.id === 720;
+            const fireDmg = hasShield ? 1 : 10;
+            p.hp = Math.max(0, p.hp - fireDmg);
+            bossMsg += ` The KBD breathes dragonfire! ${fireDmg} damage.${hasShield ? ' (shield absorbs most)' : ' Equip an anti-dragon shield!'}`;
+          }
+          npcHit = Math.random() < 0.6;
+          npcDmg = npcHit ? Math.floor(Math.random() * (npc.maxHit + 1) * (npc._phase === 3 ? 1.3 : 1)) : 0;
+        } else if (npc.defId === 'giant_mole') {
+          // Digs underground at 50% HP, teleports, re-emerges after 5 ticks
+          if (npc.hp <= 100 && !npc._hasDug) {
+            npc._hasDug = true;
+            npc._digTick = currentTick;
+            npc._isDug = true;
+            // Teleport to new position within area
+            npc.x = npc.spawnX + Math.floor(Math.random() * 6) - 3;
+            npc.y = npc.spawnY + Math.floor(Math.random() * 6) - 3;
+            bossMsg += ` The Giant Mole digs underground! It will re-emerge in 5 ticks.`;
+            npcDmg = 0; npcHit = false;
+          } else if (npc._isDug) {
+            if (currentTick - npc._digTick >= 5) {
+              npc._isDug = false;
+              bossMsg += ` The Giant Mole re-emerges at (${npc.x}, ${npc.y})!`;
+            }
+            npcDmg = 0; npcHit = false;
+          } else {
+            npcHit = Math.random() < 0.5;
+            npcDmg = npcHit ? Math.floor(Math.random() * (npc.maxHit + 1)) : 0;
+          }
+        } else if (['dharok', 'verac', 'guthan', 'ahrim', 'karil', 'torag'].includes(npc.defId)) {
+          // Barrows brother special effects
+          npcHit = Math.random() < 0.5;
+          npcDmg = npcHit ? Math.floor(Math.random() * (npc.maxHit + 1)) : 0;
+          if (npc.defId === 'dharok' && npcHit) {
+            // Hits harder at low HP
+            const hpRatio = 1 - (npc.hp / npc.maxHp);
+            npcDmg = Math.floor(npcDmg * (1 + hpRatio));
+            if (hpRatio > 0.5) bossMsg += ` Dharok's rage grows!`;
+          } else if (npc.defId === 'verac' && npcHit) {
+            // Hits through prayer (ignores protect from melee)
+            if (p.activePrayers.has('protect_from_melee')) bossMsg += ` Verac hits through your prayer!`;
+          } else if (npc.defId === 'guthan' && npcHit && npcDmg > 0) {
+            // Heals on hit
+            const heal = Math.floor(npcDmg * 0.5);
+            npc.hp = Math.min(npc.maxHp, npc.hp + heal);
+            bossMsg += ` Guthan heals ${heal} HP!`;
+          }
+        } else {
+          // Normal NPC combat
+          npcHit = Math.random() < 0.5;
+          npcDmg = npcHit ? Math.floor(Math.random() * (npc.maxHit + 1)) : 0;
+        }
+
         p.hp = Math.max(0, p.hp - npcDmg);
         if (npcDmg > 0) {
-          sendText(ws, `The ${npc.name} hits you for ${npcDmg} damage. HP: ${p.hp}/${p.maxHp}`);
+          sendText(ws, `The ${npc.name} hits you for ${npcDmg} damage. HP: ${p.hp}/${p.maxHp}${bossMsg}`);
           // Poison check (feature 6)
           if (npc.poisonDamage && npc.poisonDamage > 0 && !p.poison && Math.random() < 0.25) {
             p.poison = { damage: npc.poisonDamage };
             sendText(ws, `You have been poisoned!`);
           }
+        } else if (bossMsg) {
+          sendText(ws, bossMsg.trim());
         }
         if (p.hp <= 0) {
           actions.cancel(p);
@@ -1987,6 +2087,16 @@ function createDefaultContent() {
   npcs.defineNpc('tanner', { name: 'Tanner', examine: 'A leather worker.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Type `craft leather` to tan hides.' });
   npcs.defineNpc('herbalist', { name: 'Herbalist', examine: 'A herb shop owner.', combat: 0, maxHp: 1, wanderRadius: 1, dialogue: 'Need potion supplies? Type `shop herbalist`.' });
 
+  // ── Boss NPC Definitions ──────────────────────────────────────────────────
+  npcs.defineNpc('king_black_dragon', { name: 'King Black Dragon', examine: 'The king of all black dragons.', combat: 276, maxHp: 255, stats: { attack: 240, strength: 240, defence: 240, def_slash: 120 }, maxHit: 25, attackSpeed: 4, aggressive: true, aggroRange: 6, wanderRadius: 3, respawnTicks: 100 });
+  npcs.defineNpc('giant_mole', { name: 'Giant Mole', examine: 'An enormous mole.', combat: 230, maxHp: 200, stats: { attack: 190, strength: 180, defence: 200, def_slash: 80 }, maxHit: 18, attackSpeed: 4, aggressive: true, aggroRange: 5, wanderRadius: 4, respawnTicks: 80 });
+  npcs.defineNpc('dharok', { name: 'Dharok the Wretched', examine: 'A Barrows brother.', combat: 115, maxHp: 100, stats: { attack: 100, strength: 105, defence: 95 }, maxHit: 15, attackSpeed: 4, wanderRadius: 1, respawnTicks: 60 });
+  npcs.defineNpc('verac', { name: 'Verac the Defiled', examine: 'A Barrows brother.', combat: 115, maxHp: 100, stats: { attack: 100, strength: 95, defence: 100 }, maxHit: 13, attackSpeed: 4, wanderRadius: 1, respawnTicks: 60 });
+  npcs.defineNpc('guthan', { name: 'Guthan the Infested', examine: 'A Barrows brother.', combat: 115, maxHp: 100, stats: { attack: 95, strength: 95, defence: 95 }, maxHit: 12, attackSpeed: 4, wanderRadius: 1, respawnTicks: 60 });
+  npcs.defineNpc('ahrim', { name: 'Ahrim the Blighted', examine: 'A Barrows brother.', combat: 115, maxHp: 100, stats: { attack: 70, strength: 70, defence: 70 }, maxHit: 14, attackSpeed: 5, wanderRadius: 1, respawnTicks: 60 });
+  npcs.defineNpc('karil', { name: 'Karil the Tainted', examine: 'A Barrows brother.', combat: 115, maxHp: 100, stats: { attack: 70, strength: 70, defence: 70 }, maxHit: 14, attackSpeed: 3, wanderRadius: 1, respawnTicks: 60 });
+  npcs.defineNpc('torag', { name: 'Torag the Corrupted', examine: 'A Barrows brother.', combat: 115, maxHp: 100, stats: { attack: 95, strength: 90, defence: 105 }, maxHit: 11, attackSpeed: 5, wanderRadius: 1, respawnTicks: 60 });
+
   // ── Object Definitions ─────────────────────────────────────────────────────
   objects.defineObject('tree', { name: 'Tree', examine: 'A tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 1, xp: 25, ticks: 4, product: { id: 200, name: 'Logs', count: 1 }, depletionChance: 0.5, respawnTicks: 15 });
   objects.defineObject('oak', { name: 'Oak tree', examine: 'An oak tree.', actions: ['chop'], skill: 'woodcutting', levelReq: 15, xp: 37, ticks: 4, product: { id: 201, name: 'Oak logs', count: 1 }, depletionChance: 0.35, respawnTicks: 20 });
@@ -2017,6 +2127,17 @@ function createDefaultContent() {
   objects.defineObject('agility_ladder', { name: 'Ladder', examine: 'A ladder to climb.' });
   objects.defineObject('altar', { name: 'Altar', examine: 'An altar for prayer.', actions: ['pray'] });
   objects.defineObject('herb_patch', { name: 'Herb patch', examine: 'A patch for growing herbs.', actions: ['plant', 'harvest', 'inspect'] });
+
+  // ── Staircase objects ──────────────────────────────────────────────────────
+  objects.defineObject('staircase', { name: 'Staircase', examine: 'A staircase leading up and down.', actions: ['climb up', 'climb down'] });
+  objects.defineObject('staircase_up', { name: 'Staircase up', examine: 'A staircase leading up.', actions: ['climb up'] });
+  objects.defineObject('staircase_down', { name: 'Staircase down', examine: 'A staircase leading down.', actions: ['climb down'] });
+
+  // ── Runecrafting altars ────────────────────────────────────────────────────
+  objects.defineObject('air_altar', { name: 'Air altar', examine: 'An altar for crafting air runes.', actions: ['craft runes'] });
+  objects.defineObject('water_altar', { name: 'Water altar', examine: 'An altar for crafting water runes.', actions: ['craft runes'] });
+  objects.defineObject('earth_altar', { name: 'Earth altar', examine: 'An altar for crafting earth runes.', actions: ['craft runes'] });
+  objects.defineObject('fire_altar', { name: 'Fire altar', examine: 'An altar for crafting fire runes.', actions: ['craft runes'] });
 
   // ── Helper functions ───────────────────────────────────────────────────────
   function fillArea(x1, y1, x2, y2, tile) {
@@ -2281,6 +2402,69 @@ function createDefaultContent() {
   objects.placeObject('agility_log', 104, 80);
   objects.placeObject('agility_ladder', 107, 80);
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BOSS LAIRS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // KBD Lair (140-155, 40-55) — deep wilderness
+  fillArea(140, 40, 155, 55, T.DARK_GRASS);
+  fillArea(144, 44, 151, 51, T.FLOOR);
+  tiles.setTile(147, 47, T.LAVA); tiles.setTile(148, 47, T.LAVA);
+  tiles.defineArea('kbd_lair', { name: 'King Black Dragon Lair', x1: 140, y1: 40, x2: 155, y2: 55, pvp: false });
+  npcs.spawnNpc('king_black_dragon', 147, 48);
+  widePath(135, 48, 140, 48); // connect from wilderness
+
+  // Giant Mole Den (60-75, 120-135) — underground, layer -1
+  fillArea(60, 120, 75, 135, T.FLOOR);
+  tiles.defineArea('mole_den', { name: 'Giant Mole Den', x1: 60, y1: 120, x2: 75, y2: 135 });
+  npcs.spawnNpc('giant_mole', 67, 127);
+
+  // Barrows (140-155, 60-75) — east of wilderness
+  fillArea(140, 60, 155, 75, T.DARK_GRASS);
+  fillArea(144, 64, 151, 71, T.FLOOR);
+  tiles.defineArea('barrows', { name: 'Barrows', x1: 140, y1: 60, x2: 155, y2: 75 });
+  npcs.spawnNpc('dharok', 145, 65); npcs.spawnNpc('verac', 147, 65);
+  npcs.spawnNpc('guthan', 149, 65); npcs.spawnNpc('ahrim', 145, 69);
+  npcs.spawnNpc('karil', 147, 69); npcs.spawnNpc('torag', 149, 69);
+  widePath(135, 60, 140, 60); // connect from giant plains area
+  widePath(140, 55, 140, 60); // connect from KBD area
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DUEL ARENA (115, 70-80) — east of hunting grounds
+  // ═══════════════════════════════════════════════════════════════════════════
+  fillArea(110, 70, 125, 80, T.SAND);
+  fillArea(113, 73, 122, 77, T.FLOOR);
+  tiles.defineArea('duel_arena', { name: 'Duel Arena', x1: 110, y1: 70, x2: 125, y2: 80, safe: true, duel: true });
+  widePath(105, 75, 110, 75); // connect from hunting grounds
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // RUNECRAFTING ALTARS — scattered around the world
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Air altar — near spawn
+  fillArea(108, 95, 112, 99, T.GRASS);
+  objects.placeObject('air_altar', 110, 97);
+  tiles.defineArea('air_altar', { name: 'Air Altar', x1: 108, y1: 95, x2: 112, y2: 99 });
+
+  // Water altar — near fishing dock
+  objects.placeObject('water_altar', 93, 118);
+  tiles.defineArea('water_altar', { name: 'Water Altar', x1: 92, y1: 117, x2: 94, y2: 119 });
+
+  // Earth altar — near mining site
+  objects.placeObject('earth_altar', 116, 108);
+  tiles.defineArea('earth_altar', { name: 'Earth Altar', x1: 115, y1: 107, x2: 117, y2: 109 });
+
+  // Fire altar — near giant plains
+  objects.placeObject('fire_altar', 122, 98);
+  tiles.defineArea('fire_altar', { name: 'Fire Altar', x1: 121, y1: 97, x2: 123, y2: 99 });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STAIRCASES — town ground floor to upper floor
+  // ═══════════════════════════════════════════════════════════════════════════
+  objects.placeObject('staircase', 96, 86); // In town general store area
+  // Create upper floor (layer 1) floor tiles
+  for (let x = 94; x <= 100; x++) for (let y = 84; y <= 88; y++) tiles.setTile(x, y, T.FLOOR, 1);
+  objects.placeObject('staircase', 96, 86, 1); // Matching stairs on layer 1
+
   console.log(`[init] Default world created with ${npcs.npcs.size} NPCs, ${objects.objects.size} objects`);
 }
 
@@ -2369,6 +2553,17 @@ wss.on('connection', (ws) => {
       if (p.tutorialStep === undefined) p.tutorialStep = 0;
       if (p.tutorialComplete === undefined) p.tutorialComplete = false;
       if (!p.friends) p.friends = [];
+      // Initialize new feature fields
+      if (!p.house) p.house = [];
+      if (!p.bossKills) p.bossKills = {};
+      if (!p.unlockedTracks) p.unlockedTracks = [];
+      if (!p.diaryProgress) p.diaryProgress = {};
+      if (!p.diaryComplete) p.diaryComplete = {};
+      if (!p.diaryRewards) p.diaryRewards = {};
+      if (p.duelWins === undefined) p.duelWins = 0;
+      if (p.duelLosses === undefined) p.duelLosses = 0;
+      if (p.bhKills === undefined) p.bhKills = 0;
+      if (p.bhDeaths === undefined) p.bhDeaths = 0;
       // Initialize random event timer
       p.nextRandomEvent = tick.getTick() + 500 + Math.floor(Math.random() * 500);
       p.pendingEvent = null;

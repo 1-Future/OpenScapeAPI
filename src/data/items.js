@@ -300,4 +300,50 @@ define({ id: 950, name: 'XP lamp (small)', examine: 'Grants XP in a skill of you
 define({ id: 951, name: 'XP lamp (medium)', examine: 'Grants XP in a skill of your choice.', value: 0, tradeable: false, category: 'reward', weight: 0 });
 define({ id: 952, name: 'XP lamp (large)', examine: 'Grants XP in a skill of your choice.', value: 0, tradeable: false, category: 'reward', weight: 0 });
 
+// ── Construction planks & nails ──────────────────────────────────────────────
+define({ id: 700, name: 'Plank', examine: 'A wooden plank.', value: 100, category: 'construction', weight: 1.5 });
+define({ id: 701, name: 'Oak plank', examine: 'An oak plank.', value: 250, category: 'construction', weight: 1.5 });
+define({ id: 702, name: 'Teak plank', examine: 'A teak plank.', value: 500, category: 'construction', weight: 1.5 });
+define({ id: 703, name: 'Mahogany plank', examine: 'A mahogany plank.', value: 1500, category: 'construction', weight: 1.5 });
+define({ id: 704, name: 'Nails', examine: 'A pack of nails.', stackable: true, value: 5, category: 'construction', weight: 0 });
+define({ id: 705, name: 'Steel nails', examine: 'Steel nails.', stackable: true, value: 15, category: 'construction', weight: 0 });
+
+// ── Rune essence (runecrafting) ──────────────────────────────────────────────
+define({ id: 710, name: 'Rune essence', examine: 'An essence used for crafting runes.', stackable: false, value: 10, category: 'runecrafting', weight: 0.01 });
+define({ id: 711, name: 'Pure essence', examine: 'A purer essence for higher-tier runes.', stackable: false, value: 25, category: 'runecrafting', weight: 0.01 });
+
+// ── Anti-dragon shield ──────────────────────────────────────────────────────
+define({ id: 720, name: 'Anti-dragon shield', examine: 'Protects against dragonfire.', value: 500, category: 'armour', equipSlot: 'shield', stats: { def_stab: 5, def_slash: 6, def_crush: 7 }, weight: 2.2 });
+
+// ── Boss unique drops ────────────────────────────────────────────────────────
+define({ id: 730, name: 'Draconic visage', examine: 'A rare drop from the King Black Dragon.', value: 1000000, category: 'boss', weight: 1 });
+define({ id: 731, name: 'KBD head', examine: 'The head of the King Black Dragon.', value: 50000, tradeable: false, category: 'boss', weight: 2 });
+define({ id: 732, name: 'Mole claw', examine: 'A large claw from the Giant Mole.', value: 5000, category: 'boss', weight: 0.5 });
+define({ id: 733, name: 'Mole skin', examine: 'The skin of the Giant Mole.', value: 5000, category: 'boss', weight: 1 });
+define({ id: 734, name: "Dharok's greataxe", examine: 'A powerful Barrows weapon.', value: 200000, category: 'boss', equipSlot: 'weapon', speed: 5, equipReqs: { attack: 70, strength: 70 }, stats: { slash: 103, melee_strength: 105 }, weight: 3 });
+define({ id: 735, name: "Verac's flail", examine: 'A Barrows flail.', value: 180000, category: 'boss', equipSlot: 'weapon', speed: 4, equipReqs: { attack: 70 }, stats: { crush: 82, melee_strength: 72 }, weight: 2 });
+define({ id: 736, name: "Guthan's warspear", examine: 'A Barrows warspear.', value: 180000, category: 'boss', equipSlot: 'weapon', speed: 4, equipReqs: { attack: 70 }, stats: { stab: 85, melee_strength: 75 }, weight: 2.5 });
+define({ id: 737, name: "Ahrim's staff", examine: 'A Barrows staff.', value: 150000, category: 'boss', equipSlot: 'weapon', speed: 4, equipReqs: { attack: 70, magic: 70 }, stats: { magic: 65 }, weight: 2 });
+define({ id: 738, name: "Karil's crossbow", examine: 'A Barrows crossbow.', value: 150000, category: 'boss', equipSlot: 'weapon', speed: 4, equipReqs: { ranged: 70 }, stats: { ranged: 84, ranged_strength: 55 }, weight: 2 });
+define({ id: 739, name: "Torag's hammers", examine: 'Barrows dual hammers.', value: 150000, category: 'boss', equipSlot: 'weapon', speed: 4, equipReqs: { attack: 70, strength: 70 }, stats: { crush: 85, melee_strength: 72 }, weight: 3 });
+
+// ── Clue scroll tiers ────────────────────────────────────────────────────────
+define({ id: 902, name: 'Clue scroll (medium)', examine: 'A medium clue scroll.', value: 100, tradeable: false, category: 'clue', weight: 0 });
+
+// ── Treasure trail rewards (cosmetics) ──────────────────────────────────────
+define({ id: 910, name: 'Ranger boots', examine: 'Stylish boots of ranging.', value: 500000, category: 'clue_reward', equipSlot: 'feet', equipReqs: { ranged: 40 }, stats: { ranged: 8 }, weight: 0.5 });
+define({ id: 911, name: 'Wizard boots', examine: 'Magical footwear.', value: 100000, category: 'clue_reward', equipSlot: 'feet', equipReqs: { magic: 20 }, stats: { magic: 4 }, weight: 0.5 });
+define({ id: 912, name: 'Holy sandals', examine: 'Blessed sandals.', value: 100000, category: 'clue_reward', equipSlot: 'feet', equipReqs: { prayer: 30 }, stats: { prayer: 3 }, weight: 0.3 });
+define({ id: 913, name: 'Trimmed armour set', examine: 'A set of trimmed armour.', value: 50000, category: 'clue_reward', weight: 5 });
+define({ id: 914, name: 'Gold-trimmed armour set', examine: 'A set of gold-trimmed armour.', value: 75000, category: 'clue_reward', weight: 5 });
+define({ id: 915, name: 'Elegant shirt', examine: 'An elegant top.', value: 20000, category: 'clue_reward', equipSlot: 'body', weight: 0.5 });
+define({ id: 916, name: 'Elegant legs', examine: 'Elegant leg wear.', value: 20000, category: 'clue_reward', equipSlot: 'legs', weight: 0.5 });
+
+// ── BH emblems ──────────────────────────────────────────────────────────────
+define({ id: 920, name: 'BH emblem (tier 1)', examine: 'A bounty hunter emblem.', value: 50000, tradeable: true, category: 'pvp', weight: 0 });
+define({ id: 921, name: 'BH emblem (tier 2)', examine: 'A bounty hunter emblem.', value: 100000, tradeable: true, category: 'pvp', weight: 0 });
+
+// ── Slayer helm ──────────────────────────────────────────────────────────────
+define({ id: 925, name: 'Slayer helm', examine: 'A helmet imbued with slayer power.', value: 50000, category: 'armour', equipSlot: 'head', equipReqs: { defence: 20, slayer: 55 }, stats: { def_stab: 30, def_slash: 32, def_crush: 27 }, weight: 2 });
+
 module.exports = { define, get, find, search, items, FOOD_HEAL };

@@ -83,4 +83,56 @@ defineMaster('vannaka', {
   ],
 });
 
-module.exports = { defineMaster, assignTask, completeTask, masters };
+// ── Slayer Reward Shop ────────────────────────────────────────────────────────
+const SLAYER_REWARDS = {
+  broader_fletching: { name: 'Broader fletching', cost: 300, desc: 'Unlock the ability to fletch broad bolts.' },
+  slayer_helm: { name: 'Slayer helm', cost: 400, desc: 'Unlock the ability to craft a Slayer helm.' },
+  block_slot: { name: 'Block slot', cost: 100, desc: 'Block a monster from being assigned as a task.' },
+  extend_task: { name: 'Extend task', cost: 50, desc: 'Extend your current slayer task by 50%.' },
+  skip_task: { name: 'Skip task', cost: 30, desc: 'Skip your current slayer task.' },
+};
+
+function buyReward(player, rewardId) {
+  const reward = SLAYER_REWARDS[rewardId];
+  if (!reward) return { error: 'Unknown reward.' };
+  if (!player.slayerPoints) player.slayerPoints = 0;
+  if (player.slayerPoints < reward.cost) return { error: `You need ${reward.cost} points. You have ${player.slayerPoints}.` };
+
+  if (rewardId === 'block_slot') {
+    if (!player.slayerBlocked) player.slayerBlocked = [];
+    if (player.slayerBlocked.length >= 6) return { error: 'You already have 6 blocked monsters (max).' };
+    return { needsTarget: true, cost: reward.cost };
+  }
+  if (rewardId === 'extend_task') {
+    if (!player.slayerTask || player.slayerTask.remaining <= 0) return { error: 'You have no active task to extend.' };
+    player.slayerPoints -= reward.cost;
+    const ext = Math.floor(player.slayerTask.count * 0.5);
+    player.slayerTask.remaining += ext;
+    player.slayerTask.count += ext;
+    return { msg: `Task extended by ${ext}. New count: ${player.slayerTask.remaining}/${player.slayerTask.count}. Points: ${player.slayerPoints}.` };
+  }
+  if (rewardId === 'skip_task') {
+    if (!player.slayerTask) return { error: 'You have no task to skip.' };
+    player.slayerPoints -= reward.cost;
+    player.slayerTask = null;
+    player.slayerStreak = 0;
+    return { msg: `Task skipped. Streak reset. Points: ${player.slayerPoints}.` };
+  }
+  if (rewardId === 'broader_fletching') {
+    if (player.slayerUnlocks && player.slayerUnlocks.broader_fletching) return { error: 'Already unlocked.' };
+    player.slayerPoints -= reward.cost;
+    if (!player.slayerUnlocks) player.slayerUnlocks = {};
+    player.slayerUnlocks.broader_fletching = true;
+    return { msg: `Unlocked Broader Fletching! Points: ${player.slayerPoints}.` };
+  }
+  if (rewardId === 'slayer_helm') {
+    if (player.slayerUnlocks && player.slayerUnlocks.slayer_helm) return { error: 'Already unlocked.' };
+    player.slayerPoints -= reward.cost;
+    if (!player.slayerUnlocks) player.slayerUnlocks = {};
+    player.slayerUnlocks.slayer_helm = true;
+    return { msg: `Unlocked Slayer Helm crafting! Points: ${player.slayerPoints}.` };
+  }
+  return { error: 'Unknown reward.' };
+}
+
+module.exports = { defineMaster, assignTask, completeTask, masters, SLAYER_REWARDS, buyReward };

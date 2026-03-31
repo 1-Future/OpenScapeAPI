@@ -2138,4 +2138,745 @@ module.exports = function registerAll(ctx) {
       return "You don't have any XP lamps.";
     }
   });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 1. PLAYER-OWNED HOUSE (Construction)
+  // ══════════════════════════════════════════════════════════════════════════
+  const HOUSE_ROOMS = {
+    parlour: { name: 'Parlour', level: 1, planks: 3, nails: 5, furniture: {
+      chair: { name: 'Chair', level: 1, planks: 2, nails: 2, xp: 58 },
+      bookcase: { name: 'Bookcase', level: 4, planks: 4, nails: 4, xp: 115 },
+      fireplace: { name: 'Fireplace', level: 3, planks: 3, nails: 3, xp: 80 },
+    }},
+    kitchen: { name: 'Kitchen', level: 5, planks: 5, nails: 5, furniture: {
+      table: { name: 'Table', level: 5, planks: 4, nails: 4, xp: 87 },
+      stove: { name: 'Stove', level: 7, planks: 5, nails: 5, xp: 120 },
+      sink: { name: 'Sink', level: 6, planks: 3, nails: 3, xp: 90 },
+    }},
+    bedroom: { name: 'Bedroom', level: 10, planks: 6, nails: 6, furniture: {
+      bed: { name: 'Bed', level: 10, planks: 5, nails: 4, xp: 117 },
+      wardrobe: { name: 'Wardrobe', level: 12, planks: 6, nails: 5, xp: 150 },
+      dresser: { name: 'Dresser', level: 11, planks: 4, nails: 3, xp: 121 },
+    }},
+    chapel: { name: 'Chapel', level: 20, planks: 8, nails: 8, furniture: {
+      pew: { name: 'Pew', level: 20, planks: 5, nails: 4, xp: 200 },
+      small_altar: { name: 'Small Altar', level: 25, planks: 8, nails: 6, xp: 350 },
+    }},
+    workshop: { name: 'Workshop', level: 15, planks: 7, nails: 7, furniture: {
+      workbench: { name: 'Workbench', level: 15, planks: 5, nails: 5, xp: 143 },
+      repair_stand: { name: 'Repair Stand', level: 18, planks: 6, nails: 6, xp: 180 },
+      tool_rack: { name: 'Tool Rack', level: 16, planks: 4, nails: 4, xp: 120 },
+    }},
+  };
+
+  commands.register('house', { help: 'House commands: house, house build [room], house furniture [item], house rooms, house leave', category: 'Construction',
+    fn: (p, args) => {
+      if (!p.house) p.house = [];
+      const sub = (args[0] || '').toLowerCase();
+
+      if (!sub || sub === 'enter') {
+        // Teleport to house
+        if (p.house.length === 0) return 'You don\'t have a house yet. Build a room first with `house build [room]`.';
+        p.houseLocation = { x: p.x, y: p.y, layer: p.layer };
+        p.x = 1000; p.y = 1000; p.layer = 99; p.path = [];
+        return `You teleport to your house.\nRooms: ${p.house.map(r => r.type).join(', ')}\nType \`house rooms\` for details, \`house leave\` to exit.`;
+      }
+
+      if (sub === 'build') {
+        const roomType = args.slice(1).join(' ').toLowerCase();
+        const roomDef = HOUSE_ROOMS[roomType];
+        if (!roomDef) return `Unknown room type. Available: ${Object.keys(HOUSE_ROOMS).join(', ')}`;
+        if (getLevel(p, 'construction') < roomDef.level) return `You need Construction level ${roomDef.level} to build a ${roomDef.name}.`;
+        if (invCount(p, 700) < roomDef.planks) return `You need ${roomDef.planks} planks.`;
+        if (invCount(p, 704) < roomDef.nails) return `You need ${roomDef.nails} nails.`;
+        if (p.house.some(r => r.type === roomType)) return `You already have a ${roomDef.name}.`;
+        invRemove(p, 700, roomDef.planks);
+        invRemove(p, 704, roomDef.nails);
+        updateWeight(p);
+        const buildXp = roomDef.planks * 30;
+        const lvl = addXp(p, 'construction', buildXp);
+        p.house.push({ type: roomType, furniture: {} });
+        let msg = `You build a ${roomDef.name}!${xpDrop('construction', buildXp)}`;
+        if (lvl) msg += levelUpMsg('construction', lvl);
+        return msg;
+      }
+
+      if (sub === 'furniture') {
+        const furnitureName = args.slice(1).join(' ').toLowerCase();
+        if (!furnitureName) {
+          // List available furniture for current room
+          if (p.layer !== 99) return 'You must be in your house. Type `house` to enter.';
+          let out = '── Available Furniture ──\n';
+          for (const room of p.house) {
+            const roomDef = HOUSE_ROOMS[room.type];
+            if (!roomDef) continue;
+            out += `\n${roomDef.name}:\n`;
+            for (const [fId, fDef] of Object.entries(roomDef.furniture)) {
+              const built = room.furniture[fId] ? ' [BUILT]' : '';
+              out += `  ${fDef.name} (lvl ${fDef.level}, ${fDef.planks} planks, ${fDef.nails} nails, ${fDef.xp} XP)${built}\n`;
+            }
+          }
+          return out;
+        }
+        if (p.layer !== 99) return 'You must be in your house. Type `house` to enter.';
+        // Find which room has this furniture
+        for (const room of p.house) {
+          const roomDef = HOUSE_ROOMS[room.type];
+          if (!roomDef) continue;
+          for (const [fId, fDef] of Object.entries(roomDef.furniture)) {
+            if (fDef.name.toLowerCase() === furnitureName || fId === furnitureName) {
+              if (room.furniture[fId]) return `${fDef.name} is already built.`;
+              if (getLevel(p, 'construction') < fDef.level) return `You need Construction level ${fDef.level}.`;
+              if (invCount(p, 700) < fDef.planks) return `You need ${fDef.planks} planks.`;
+              if (invCount(p, 704) < fDef.nails) return `You need ${fDef.nails} nails.`;
+              invRemove(p, 700, fDef.planks);
+              invRemove(p, 704, fDef.nails);
+              updateWeight(p);
+              room.furniture[fId] = true;
+              const lvl = addXp(p, 'construction', fDef.xp);
+              let msg = `You build a ${fDef.name} in the ${roomDef.name}.${xpDrop('construction', fDef.xp)}`;
+              if (lvl) msg += levelUpMsg('construction', lvl);
+              events.emit('skill_action', { player: p, skill: 'construction' });
+              return msg;
+            }
+          }
+        }
+        return `Unknown furniture: "${furnitureName}". Type \`house furniture\` to see options.`;
+      }
+
+      if (sub === 'rooms') {
+        if (p.house.length === 0) return 'No rooms built. Use `house build [room]`.';
+        let out = '── Your House ──\n';
+        for (const room of p.house) {
+          const roomDef = HOUSE_ROOMS[room.type];
+          if (!roomDef) continue;
+          const furnitureList = Object.entries(roomDef.furniture).map(([fId, fDef]) => {
+            return `${fDef.name}: ${room.furniture[fId] ? 'Built' : 'Empty'}`;
+          }).join(', ');
+          out += `  ${roomDef.name}: ${furnitureList}\n`;
+        }
+        return out;
+      }
+
+      if (sub === 'leave') {
+        if (p.layer !== 99) return 'You are not in your house.';
+        const loc = p.houseLocation || { x: 100, y: 100, layer: 0 };
+        p.x = loc.x; p.y = loc.y; p.layer = loc.layer; p.path = [];
+        p.houseLocation = null;
+        return 'You leave your house.';
+      }
+
+      return 'Usage: house, house build [room], house furniture [item], house rooms, house leave';
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 2. BOSS ENCOUNTERS
+  // ══════════════════════════════════════════════════════════════════════════
+  const BOSS_INFO = {
+    'king black dragon': { defId: 'king_black_dragon', name: 'King Black Dragon', combat: 276, hp: 255, desc: '3 phases (170/85 HP). Dragonfire every 5 ticks (10 dmg, anti-dragon shield reduces to 1). Location: KBD Lair (NE wilderness).' },
+    'giant mole': { defId: 'giant_mole', name: 'Giant Mole', combat: 230, hp: 200, desc: 'Digs underground at 50% HP and teleports. Re-emerges after 5 ticks. Location: Mole Den (SW).' },
+    'barrows': { defId: 'barrows', name: 'Barrows Brothers', combat: 115, hp: '100 each', desc: '6 brothers fought sequentially. Dharok: hits harder at low HP. Verac: hits through prayer. Guthan: heals on hit. Location: Barrows (E).' },
+  };
+
+  commands.register('boss', { help: 'Boss info: boss [name]', category: 'Combat',
+    fn: (p, args) => {
+      const name = args.join(' ').toLowerCase();
+      if (!name) {
+        let out = '── Bosses ──\n';
+        for (const [, info] of Object.entries(BOSS_INFO)) {
+          const kc = p.bossKills?.[info.defId] || 0;
+          out += `  ${info.name} (Combat ${info.combat}, ${info.hp} HP) — KC: ${kc}\n`;
+        }
+        out += '\nType `boss [name]` for details.';
+        return out;
+      }
+      const info = BOSS_INFO[name];
+      if (!info) return `Unknown boss. Available: ${Object.values(BOSS_INFO).map(b => b.name).join(', ')}`;
+      const kc = p.bossKills?.[info.defId] || 0;
+      return `── ${info.name} ──\nCombat: ${info.combat} | HP: ${info.hp}\n${info.desc}\nYour KC: ${kc}`;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 3. TREASURE TRAILS (Clue Scrolls)
+  // ══════════════════════════════════════════════════════════════════════════
+  const CLUE_STEPS = {
+    beginner: [
+      { type: 'coordinate', x: 82, y: 98, hint: 'Dig at (82, 98) — somewhere near the cows.' },
+      { type: 'riddle', area: 'dock', hint: 'I am found where nets meet the sea.' },
+      { type: 'emote', emote: 'dance', area: 'mines', hint: 'Perform the dance emote at the mining site.' },
+      { type: 'coordinate', x: 75, y: 64, hint: 'Dig at (75, 64) — green creatures lurk here.' },
+      { type: 'riddle', area: 'town', hint: 'I am found where merchants gather.' },
+    ],
+    medium: [
+      { type: 'coordinate', x: 130, y: 45, hint: 'Dig at (130, 45) — deep in dangerous territory.' },
+      { type: 'riddle', area: 'forest', hint: 'I am found among ancient trees.' },
+      { type: 'emote', emote: 'bow', area: 'giant_plains', hint: 'Bow before the giants.' },
+      { type: 'coordinate', x: 128, y: 113, hint: 'Dig at (128, 113) — precious metals gleam.' },
+      { type: 'riddle', area: 'goblin_village', hint: 'I am found in a settlement of small green folk.' },
+      { type: 'emote', emote: 'clap', area: 'fields', hint: 'Clap at the farmlands.' },
+      { type: 'coordinate', x: 110, y: 97, hint: 'Dig at (110, 97) — near the air altar.' },
+    ],
+  };
+
+  const CLUE_REWARDS = {
+    beginner: [
+      { id: 101, name: 'Coins', min: 500, max: 5000, stackable: true },
+      { id: 270, name: 'Air rune', min: 20, max: 50, stackable: true },
+      { id: 915, name: 'Elegant shirt', min: 1, max: 1 },
+      { id: 916, name: 'Elegant legs', min: 1, max: 1 },
+    ],
+    medium: [
+      { id: 101, name: 'Coins', min: 5000, max: 50000, stackable: true },
+      { id: 277, name: 'Death rune', min: 20, max: 100, stackable: true },
+      { id: 910, name: 'Ranger boots', min: 1, max: 1 },
+      { id: 911, name: 'Wizard boots', min: 1, max: 1 },
+      { id: 912, name: 'Holy sandals', min: 1, max: 1 },
+      { id: 913, name: 'Trimmed armour set', min: 1, max: 1 },
+      { id: 914, name: 'Gold-trimmed armour set', min: 1, max: 1 },
+    ],
+  };
+
+  function startClue(p, tier) {
+    const steps = CLUE_STEPS[tier];
+    if (!steps) return;
+    const numSteps = tier === 'beginner' ? 3 : 5;
+    // Pick random steps
+    const shuffled = [...steps].sort(() => Math.random() - 0.5);
+    const selected = shuffled.slice(0, numSteps);
+    p.activeClue = { tier, steps: selected, currentStep: 0 };
+  }
+
+  commands.register('clue', { help: 'Show current clue scroll step', category: 'Items',
+    fn: (p) => {
+      if (!p.activeClue) {
+        // Check if player has a clue scroll in inventory
+        const beginnerSlot = p.inventory.findIndex(s => s && s.id === 900);
+        const mediumSlot = p.inventory.findIndex(s => s && s.id === 902);
+        if (beginnerSlot >= 0) {
+          p.inventory[beginnerSlot] = p.inventory[beginnerSlot].count > 1 ? { ...p.inventory[beginnerSlot], count: p.inventory[beginnerSlot].count - 1 } : null;
+          startClue(p, 'beginner');
+          return `You open the beginner clue scroll.\nStep 1/${p.activeClue.steps.length}: ${p.activeClue.steps[0].hint}`;
+        }
+        if (mediumSlot >= 0) {
+          p.inventory[mediumSlot] = p.inventory[mediumSlot].count > 1 ? { ...p.inventory[mediumSlot], count: p.inventory[mediumSlot].count - 1 } : null;
+          startClue(p, 'medium');
+          return `You open the medium clue scroll.\nStep 1/${p.activeClue.steps.length}: ${p.activeClue.steps[0].hint}`;
+        }
+        return 'You have no active clue scroll. Get one from monster drops.';
+      }
+      const step = p.activeClue.steps[p.activeClue.currentStep];
+      return `── Clue Scroll (${p.activeClue.tier}) ──\nStep ${p.activeClue.currentStep + 1}/${p.activeClue.steps.length}: ${step.hint}`;
+    }
+  });
+
+  function advanceClue(p) {
+    if (!p.activeClue) return null;
+    p.activeClue.currentStep++;
+    if (p.activeClue.currentStep >= p.activeClue.steps.length) {
+      // Complete! Roll rewards
+      const tier = p.activeClue.tier;
+      const rewardPool = CLUE_REWARDS[tier];
+      const numRewards = 1 + Math.floor(Math.random() * 3);
+      const rewards = [];
+      for (let i = 0; i < numRewards; i++) {
+        const r = rewardPool[Math.floor(Math.random() * rewardPool.length)];
+        const count = r.min + Math.floor(Math.random() * (r.max - r.min + 1));
+        invAdd(p, r.id, r.name, count, r.stackable);
+        rewards.push(`${r.name} x${count}`);
+      }
+      p.activeClue = null;
+      return `Clue scroll complete! Rewards:\n  ${rewards.join('\n  ')}`;
+    }
+    const nextStep = p.activeClue.steps[p.activeClue.currentStep];
+    return `Step complete! Next step ${p.activeClue.currentStep + 1}/${p.activeClue.steps.length}: ${nextStep.hint}`;
+  }
+
+  commands.register('dig', { help: 'Dig at your current location (for clue scrolls)', category: 'Items',
+    fn: (p) => {
+      if (!p.activeClue) return 'You dig but find nothing interesting.';
+      const step = p.activeClue.steps[p.activeClue.currentStep];
+      if (step.type !== 'coordinate') return 'You dig but find nothing interesting.';
+      if (Math.abs(p.x - step.x) > 1 || Math.abs(p.y - step.y) > 1) return 'You dig but find nothing interesting.';
+      return advanceClue(p);
+    }
+  });
+
+  // Hook emote for clue checking
+  const existingEmote = commands.commands.get('emote');
+  if (existingEmote) {
+    const origEmoteFn = existingEmote.fn;
+    existingEmote.fn = (p, args, raw) => {
+      const result = origEmoteFn(p, args, raw);
+      // Check clue step
+      if (p.activeClue) {
+        const step = p.activeClue.steps[p.activeClue.currentStep];
+        if (step.type === 'emote') {
+          const emoteName = args.join(' ').toLowerCase();
+          const area = tiles.getArea(p.x, p.y, p.layer);
+          if (emoteName === step.emote && area && area.id === step.area) {
+            const clueResult = advanceClue(p);
+            if (clueResult) {
+              for (const [w, pl] of players) { if (pl === p) { sendText(w, clueResult); break; } }
+            }
+          }
+        }
+      }
+      return result;
+    };
+  }
+
+  // Hook movement for riddle clue checking
+  events.on('player_move', 'clue_riddle_check', (data) => {
+    const { player: p, ws } = data;
+    if (!p || !ws || !p.activeClue) return;
+    const step = p.activeClue.steps[p.activeClue.currentStep];
+    if (step.type !== 'riddle') return;
+    const area = tiles.getArea(p.x, p.y, p.layer);
+    if (area && area.id === step.area) {
+      const result = advanceClue(p);
+      if (result) sendText(ws, result);
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 4. DUEL ARENA
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('duel', { help: 'Duel a player: duel [player], duel accept, duel rules [rule], duel stats', category: 'Combat',
+    fn: (p, args) => {
+      const sub = (args[0] || '').toLowerCase();
+
+      if (sub === 'stats') {
+        return `── Duel Stats ──\nWins: ${p.duelWins || 0}\nLosses: ${p.duelLosses || 0}\nWin rate: ${(p.duelWins || 0) + (p.duelLosses || 0) > 0 ? ((p.duelWins / ((p.duelWins || 0) + (p.duelLosses || 0))) * 100).toFixed(1) + '%' : 'N/A'}`;
+      }
+
+      if (sub === 'accept') {
+        if (!p.duelChallenge) return 'No pending duel challenge.';
+        const challenger = findPlayer(p.duelChallenge.from);
+        if (!challenger) { p.duelChallenge = null; return 'Challenger is no longer online.'; }
+        // Start duel
+        p.inDuel = true;
+        challenger.inDuel = true;
+        p.duelChallenge = null;
+        challenger.duelChallenge = null;
+        // Save locations and teleport to arena
+        p._preDuelLoc = { x: p.x, y: p.y, layer: p.layer };
+        challenger._preDuelLoc = { x: challenger.x, y: challenger.y, layer: challenger.layer };
+        p.x = 117; p.y = 75; p.layer = 0; p.path = [];
+        challenger.x = 118; challenger.y = 75; challenger.layer = 0; challenger.path = [];
+        // Set PvP targets
+        p.pvpTarget = challenger.id; p.busy = true;
+        challenger.pvpTarget = p.id; challenger.busy = true;
+        for (const [w, pl] of players) {
+          if (pl === challenger) sendText(w, `Duel started against ${p.name}! Fight!`);
+        }
+        return `Duel started against ${challenger.name}! Fight!`;
+      }
+
+      if (sub === 'rules') {
+        const rule = args.slice(1).join(' ').toLowerCase();
+        if (!rule) {
+          if (!p.duelChallenge) return 'No pending duel. Challenge someone first.';
+          const rules = p.duelChallenge.rules || {};
+          return `── Duel Rules ──\nNo food: ${rules.noFood ? 'ON' : 'OFF'}\nNo prayer: ${rules.noPrayer ? 'ON' : 'OFF'}\nNo special: ${rules.noSpecial ? 'ON' : 'OFF'}`;
+        }
+        if (!p.duelChallenge) return 'No pending duel.';
+        if (!p.duelChallenge.rules) p.duelChallenge.rules = {};
+        if (rule === 'no food') { p.duelChallenge.rules.noFood = !p.duelChallenge.rules.noFood; return `No food: ${p.duelChallenge.rules.noFood ? 'ON' : 'OFF'}`; }
+        if (rule === 'no prayer') { p.duelChallenge.rules.noPrayer = !p.duelChallenge.rules.noPrayer; return `No prayer: ${p.duelChallenge.rules.noPrayer ? 'ON' : 'OFF'}`; }
+        if (rule === 'no special') { p.duelChallenge.rules.noSpecial = !p.duelChallenge.rules.noSpecial; return `No special: ${p.duelChallenge.rules.noSpecial ? 'ON' : 'OFF'}`; }
+        return 'Rules: no food, no prayer, no special';
+      }
+
+      // Challenge a player
+      const targetName = args.join(' ');
+      if (!targetName) return 'Usage: duel [player], duel accept, duel rules [rule], duel stats';
+      const target = findPlayer(targetName);
+      if (!target) return `Player "${targetName}" not found.`;
+      if (target === p) return "You can't duel yourself.";
+      target.duelChallenge = { from: p.name, rules: {} };
+      for (const [w, pl] of players) {
+        if (pl === target) sendText(w, `${p.name} challenges you to a duel! Type \`duel accept\` or \`duel rules\`.`);
+      }
+      return `Duel challenge sent to ${target.name}. Waiting for acceptance...`;
+    }
+  });
+
+  // Hook into PvP death for duel completion
+  events.on('player_death', 'duel_death', (data) => {
+    const { player: p, ws } = data;
+    if (!p.inDuel) return;
+    p.inDuel = false;
+    // Find the opponent (the one who was dueling this player)
+    for (const [w, pl] of players) {
+      if (pl.inDuel && pl.pvpTarget === p.id) {
+        pl.inDuel = false;
+        pl.pvpTarget = null;
+        pl.busy = false;
+        pl.duelWins = (pl.duelWins || 0) + 1;
+        p.duelLosses = (p.duelLosses || 0) + 1;
+        sendText(w, `You have won the duel against ${p.name}! Wins: ${pl.duelWins}, Losses: ${pl.duelLosses}`);
+        // Return winner to pre-duel location
+        if (pl._preDuelLoc) {
+          pl.x = pl._preDuelLoc.x; pl.y = pl._preDuelLoc.y; pl.layer = pl._preDuelLoc.layer;
+          delete pl._preDuelLoc;
+        }
+        break;
+      }
+    }
+    // Duel is safe — restore loser's items (they keep everything)
+    // Return loser to pre-duel location
+    if (p._preDuelLoc) {
+      p.x = p._preDuelLoc.x; p.y = p._preDuelLoc.y; p.layer = p._preDuelLoc.layer;
+      delete p._preDuelLoc;
+    }
+    p.hp = p.maxHp; // Full heal after duel
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 5. MUSIC SYSTEM
+  // ══════════════════════════════════════════════════════════════════════════
+  const ALL_TRACKS = [
+    'Newbie Melody', 'Harmony', 'Autumn Voyage', 'Flute Salad', 'Country Jig',
+    'Dwarven Domain', 'Sea Shanty 2', 'Goblin Game', 'Scape Main', 'Wilderness',
+    'Dark Wilderness', 'Dragon Slayer', 'Subterranea', 'Barrows', 'Duel Arena',
+    'Rune Essence', 'Waterfall', 'Crystal Cave', 'Volcanic',
+  ];
+
+  commands.register('music', { help: 'Music: music, music list, music play [track]', category: 'General',
+    fn: (p, args) => {
+      if (!p.unlockedTracks) p.unlockedTracks = [];
+      const sub = (args[0] || '').toLowerCase();
+
+      if (!sub) {
+        return `Now playing: ${p.currentTrack || 'Nothing'}\nTracks unlocked: ${p.unlockedTracks.length}/${ALL_TRACKS.length}`;
+      }
+
+      if (sub === 'list') {
+        let out = `── Music Tracks (${p.unlockedTracks.length}/${ALL_TRACKS.length}) ──\n`;
+        for (const track of ALL_TRACKS) {
+          const unlocked = p.unlockedTracks.includes(track);
+          const playing = p.currentTrack === track;
+          out += `  ${unlocked ? '[+]' : '[-]'} ${unlocked ? track : '???'}${playing ? ' (now playing)' : ''}\n`;
+        }
+        if (p.unlockedTracks.length >= ALL_TRACKS.length) out += '\nAll tracks unlocked! Music cape achieved!';
+        return out;
+      }
+
+      if (sub === 'play') {
+        const trackName = args.slice(1).join(' ');
+        const track = p.unlockedTracks.find(t => t.toLowerCase() === trackName.toLowerCase());
+        if (!track) return `Track not unlocked or unknown: "${trackName}". Type \`music list\` to see unlocked tracks.`;
+        p.currentTrack = track;
+        return `Now playing: ${track}`;
+      }
+
+      return 'Usage: music, music list, music play [track]';
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 6. SLAYER REWARD SHOP
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('slayershop', { help: 'Slayer reward shop: slayershop, slayer buy [reward]', aliases: ['slayer shop'], category: 'Combat',
+    fn: (p, args) => {
+      const sub = (args[0] || '').toLowerCase();
+      if (sub === 'buy') {
+        const rewardName = args.slice(1).join(' ').toLowerCase().replace(/\s+/g, '_');
+        // Also try without underscores
+        let rewardId = rewardName;
+        if (!slayer.SLAYER_REWARDS[rewardId]) {
+          rewardId = Object.keys(slayer.SLAYER_REWARDS).find(k => slayer.SLAYER_REWARDS[k].name.toLowerCase() === args.slice(1).join(' ').toLowerCase());
+        }
+        if (!rewardId) return `Unknown reward. Type \`slayershop\` to see available rewards.`;
+
+        if (rewardId === 'block_slot') {
+          const monsterName = args.slice(3).join(' ').toLowerCase();
+          if (!monsterName) return 'Usage: slayershop buy block slot [monster name]';
+          if (!p.slayerBlocked) p.slayerBlocked = [];
+          if (p.slayerBlocked.includes(monsterName)) return `${monsterName} is already blocked.`;
+          if (!p.slayerPoints || p.slayerPoints < 100) return `You need 100 points. You have ${p.slayerPoints || 0}.`;
+          p.slayerPoints -= 100;
+          p.slayerBlocked.push(monsterName);
+          return `Blocked ${monsterName}. Points: ${p.slayerPoints}. Blocked list: ${p.slayerBlocked.join(', ')}`;
+        }
+
+        const result = slayer.buyReward(p, rewardId);
+        if (result.error) return result.error;
+        return result.msg;
+      }
+
+      // Show shop
+      let out = `── Slayer Reward Shop ──\nYour points: ${p.slayerPoints || 0}\n`;
+      for (const [id, reward] of Object.entries(slayer.SLAYER_REWARDS)) {
+        out += `  ${reward.name} — ${reward.cost} pts — ${reward.desc}\n`;
+      }
+      out += '\nType `slayershop buy [reward name]` to purchase.';
+      return out;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 7. BOUNTY HUNTER
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('target', { help: 'Show your Bounty Hunter target', category: 'Combat',
+    fn: (p) => {
+      if (p.y > 55) return 'You must be in the Wilderness for Bounty Hunter.';
+      // Find a target among wilderness players
+      if (!p.bhTarget) {
+        const wildyPlayers = [];
+        for (const [, pl] of players) {
+          if (pl !== p && pl.y <= 55 && pl.connected && !pl.bhTarget) {
+            const pCombat = combatLevel(p);
+            const tCombat = combatLevel(pl);
+            const wildyLevel = Math.max(55 - p.y, 55 - pl.y);
+            if (Math.abs(pCombat - tCombat) <= wildyLevel) wildyPlayers.push(pl);
+          }
+        }
+        if (!wildyPlayers.length) return 'No suitable targets found in the Wilderness.';
+        const target = wildyPlayers[Math.floor(Math.random() * wildyPlayers.length)];
+        p.bhTarget = target.id;
+        target.bhTarget = p.id;
+        for (const [w, pl] of players) {
+          if (pl === target) sendText(w, `You have been assigned as ${p.name}'s Bounty Hunter target!`);
+        }
+        return `Bounty Hunter target: ${target.name} (Combat ${combatLevel(target)})`;
+      }
+      // Show existing target
+      for (const [, pl] of players) {
+        if (pl.id === p.bhTarget) {
+          return `BH Target: ${pl.name} (Combat ${combatLevel(pl)}) at approximately (${pl.x}, ${pl.y})`;
+        }
+      }
+      p.bhTarget = null;
+      return 'Your target is no longer available. Type `target` to get a new one.';
+    }
+  });
+
+  commands.register('bounty', { help: 'Show Bounty Hunter stats', category: 'Combat',
+    fn: (p) => {
+      return `── Bounty Hunter ──\nKills: ${p.bhKills || 0}\nDeaths: ${p.bhDeaths || 0}\nCurrent target: ${p.bhTarget ? 'Active' : 'None'}`;
+    }
+  });
+
+  // Hook PvP kills for BH
+  events.on('npc_kill', 'bh_kill_check', () => {}); // placeholder
+  // We hook into the PvP death section in server.js via events
+  events.on('player_death', 'bh_death_check', (data) => {
+    const { player: p, ws, killer } = data;
+    if (!killer || !killer.id) return; // Only player killers
+    // Check if killer had BH target = dead player
+    for (const [w, pl] of players) {
+      if (pl.bhTarget === p.id) {
+        pl.bhKills = (pl.bhKills || 0) + 1;
+        p.bhDeaths = (p.bhDeaths || 0) + 1;
+        // Award BH emblem
+        invAdd(pl, 920, 'BH emblem (tier 1)', 1);
+        sendText(w, `Bounty Hunter kill! +1 BH emblem. BH Kills: ${pl.bhKills}`);
+        pl.bhTarget = null;
+        p.bhTarget = null;
+        break;
+      }
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 8. ACHIEVEMENT DIARY
+  // ══════════════════════════════════════════════════════════════════════════
+  const ACHIEVEMENT_DIARIES = {
+    lumbridge: {
+      name: 'Lumbridge', tier: 'Easy',
+      tasks: {
+        chop_tree: { desc: 'Chop a tree', skill: 'woodcutting' },
+        mine_copper: { desc: 'Mine copper ore', skill: 'mining' },
+        catch_shrimp: { desc: 'Catch shrimps', skill: 'fishing' },
+        kill_goblin: { desc: 'Kill a goblin', target: 'goblin' },
+      },
+      reward: { name: '10% more XP in Lumbridge', xpBonus: 0.1, area: 'fields' },
+    },
+    varrock: {
+      name: 'Varrock', tier: 'Medium',
+      tasks: {
+        mine_iron: { desc: 'Mine iron ore', skill: 'mining', itemId: 212 },
+        smith_bars: { desc: 'Smith a bar at the furnace', skill: 'smithing' },
+        kill_guard: { desc: 'Kill a guard', target: 'guard' },
+        complete_quest: { desc: 'Complete any quest', type: 'quest' },
+      },
+      reward: { name: '10% more XP in Town', xpBonus: 0.1, area: 'town' },
+    },
+  };
+
+  commands.register('diary', { help: 'Achievement diaries: diary, diary [region]', category: 'General',
+    fn: (p, args) => {
+      if (!p.diaryProgress) p.diaryProgress = {};
+      if (!p.diaryComplete) p.diaryComplete = {};
+      if (!p.diaryRewards) p.diaryRewards = {};
+
+      const region = args.join(' ').toLowerCase();
+      if (!region) {
+        let out = '── Achievement Diaries ──\n';
+        for (const [id, diary] of Object.entries(ACHIEVEMENT_DIARIES)) {
+          const complete = p.diaryComplete[id] || false;
+          const taskCount = Object.keys(diary.tasks).length;
+          const doneCount = p.diaryProgress[id] ? Object.keys(p.diaryProgress[id]).filter(k => p.diaryProgress[id][k]).length : 0;
+          out += `  ${complete ? '[DONE]' : `[${doneCount}/${taskCount}]`} ${diary.name} (${diary.tier}) — ${diary.reward.name}\n`;
+        }
+        out += '\nType `diary [region]` for details.';
+        return out;
+      }
+
+      const diary = ACHIEVEMENT_DIARIES[region];
+      if (!diary) return `Unknown diary: "${region}". Available: ${Object.keys(ACHIEVEMENT_DIARIES).join(', ')}`;
+      if (!p.diaryProgress[region]) p.diaryProgress[region] = {};
+
+      let out = `── ${diary.name} Diary (${diary.tier}) ──\n`;
+      for (const [taskId, task] of Object.entries(diary.tasks)) {
+        const done = p.diaryProgress[region][taskId] || false;
+        out += `  ${done ? '[X]' : '[ ]'} ${task.desc}\n`;
+      }
+      out += `\nReward: ${diary.reward.name}`;
+      if (p.diaryComplete[region]) out += ' (CLAIMED)';
+      else {
+        const allDone = Object.keys(diary.tasks).every(k => p.diaryProgress[region][k]);
+        if (allDone && !p.diaryComplete[region]) {
+          p.diaryComplete[region] = true;
+          p.diaryRewards[region] = true;
+          out += '\n\nAll tasks complete! Reward activated!';
+        }
+      }
+      return out;
+    }
+  });
+
+  // Track diary tasks via events
+  events.on('npc_kill', 'diary_kill_track', (data) => {
+    const { player: p, npc } = data;
+    if (!p.diaryProgress) p.diaryProgress = {};
+    const npcName = npc.name.toLowerCase();
+    for (const [diaryId, diary] of Object.entries(ACHIEVEMENT_DIARIES)) {
+      if (!p.diaryProgress[diaryId]) p.diaryProgress[diaryId] = {};
+      for (const [taskId, task] of Object.entries(diary.tasks)) {
+        if (task.target && task.target === npcName && !p.diaryProgress[diaryId][taskId]) {
+          p.diaryProgress[diaryId][taskId] = true;
+          for (const [w, pl] of players) {
+            if (pl === p) { sendText(w, `Diary task complete: ${task.desc} (${diary.name})`); break; }
+          }
+        }
+      }
+    }
+  });
+
+  events.on('skill_action', 'diary_skill_track', (data) => {
+    const { player: p, skill } = data;
+    if (!p.diaryProgress) p.diaryProgress = {};
+    for (const [diaryId, diary] of Object.entries(ACHIEVEMENT_DIARIES)) {
+      if (!p.diaryProgress[diaryId]) p.diaryProgress[diaryId] = {};
+      for (const [taskId, task] of Object.entries(diary.tasks)) {
+        if (task.skill && task.skill === skill && !p.diaryProgress[diaryId][taskId]) {
+          p.diaryProgress[diaryId][taskId] = true;
+          for (const [w, pl] of players) {
+            if (pl === p) { sendText(w, `Diary task complete: ${task.desc} (${diary.name})`); break; }
+          }
+        }
+      }
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 9. RUNECRAFTING PROPER
+  // ══════════════════════════════════════════════════════════════════════════
+  const RC_ALTARS = {
+    air_altar: { runeId: 270, runeName: 'Air rune', level: 1, xp: 5, multiLevels: [1, 11, 22, 33, 44, 55, 66, 77, 88, 99] },
+    water_altar: { runeId: 271, runeName: 'Water rune', level: 5, xp: 6, multiLevels: [5, 19, 38, 57, 76, 95] },
+    earth_altar: { runeId: 272, runeName: 'Earth rune', level: 9, xp: 6.5, multiLevels: [9, 26, 52, 78] },
+    fire_altar: { runeId: 273, runeName: 'Fire rune', level: 14, xp: 7, multiLevels: [14, 35, 70] },
+  };
+
+  commands.register('craftrunes', { help: 'Craft runes at an altar: craftrunes', aliases: ['craft runes'], category: 'Skills',
+    fn: (p) => {
+      // Find nearby altar
+      let foundAltar = null;
+      const altarNames = { air_altar: 'Air altar', water_altar: 'Water altar', earth_altar: 'Earth altar', fire_altar: 'Fire altar' };
+      for (const [defId, name] of Object.entries(altarNames)) {
+        const obj = objects.findObjectByName(name, p.x, p.y, 3, p.layer);
+        if (obj) { foundAltar = { defId: obj.defId, ...RC_ALTARS[defId] }; break; }
+      }
+      if (!foundAltar) return 'You need to be near a runecrafting altar.';
+      if (getLevel(p, 'runecrafting') < foundAltar.level) return `You need Runecrafting level ${foundAltar.level}.`;
+      const essenceCount = invCount(p, 710);
+      if (essenceCount === 0) return 'You have no rune essence.';
+
+      // Calculate multiplier
+      const rcLevel = getLevel(p, 'runecrafting');
+      let multi = 1;
+      for (const lvl of foundAltar.multiLevels) {
+        if (rcLevel >= lvl) multi++;
+      }
+      multi = Math.max(1, multi - 1); // First entry is base level
+
+      const runesPerEssence = multi;
+      const totalRunes = essenceCount * runesPerEssence;
+      invRemove(p, 710, essenceCount);
+      invAdd(p, foundAltar.runeId, foundAltar.runeName, totalRunes, true);
+      const xp = foundAltar.xp * essenceCount;
+      const lvl = addXp(p, 'runecrafting', xp);
+      updateWeight(p);
+      let msg = `You craft ${totalRunes} ${foundAltar.runeName}s from ${essenceCount} essence. (${runesPerEssence}x per essence)${xpDrop('runecrafting', xp)}`;
+      if (lvl) msg += levelUpMsg('runecrafting', lvl);
+      events.emit('skill_action', { player: p, skill: 'runecrafting' });
+      return msg;
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 10. STAIRS / LAYER TRANSITIONS
+  // ══════════════════════════════════════════════════════════════════════════
+  commands.register('climbup', { help: 'Climb up stairs', aliases: ['climb up'], category: 'Navigation',
+    fn: (p) => {
+      const stairNames = ['Staircase', 'Staircase up'];
+      let found = null;
+      for (const name of stairNames) {
+        found = objects.findObjectByName(name, p.x, p.y, 2, p.layer);
+        if (found) break;
+      }
+      if (!found) return 'There are no stairs nearby to climb up.';
+      p.layer += 1;
+      p.path = [];
+      const area = tiles.getArea(p.x, p.y, p.layer);
+      return `You climb up the stairs to layer ${p.layer}.${area ? ' Area: ' + area.name : ''}`;
+    }
+  });
+
+  commands.register('climbdown', { help: 'Climb down stairs', aliases: ['climb down'], category: 'Navigation',
+    fn: (p) => {
+      const stairNamesDown = ['Staircase', 'Staircase down'];
+      let found = null;
+      for (const name of stairNamesDown) {
+        found = objects.findObjectByName(name, p.x, p.y, 2, p.layer);
+        if (found) break;
+      }
+      if (!found) return 'There are no stairs nearby to climb down.';
+      p.layer -= 1;
+      p.path = [];
+      const area = tiles.getArea(p.x, p.y, p.layer);
+      return `You climb down the stairs to layer ${p.layer}.${area ? ' Area: ' + area.name : ''}`;
+    }
+  });
+
+  // Override the existing 'climb' alias to handle 'climb up' and 'climb down' naturally
+  const existingClimb = commands.commands.get('climb');
+  if (existingClimb) {
+    const origClimbFn = existingClimb.fn;
+    existingClimb.fn = (p, args, raw) => {
+      const sub = args.join(' ').toLowerCase();
+      if (sub === 'up' || sub.startsWith('up')) {
+        return commands.execute(p, 'climbup');
+      }
+      if (sub === 'down' || sub.startsWith('down')) {
+        return commands.execute(p, 'climbdown');
+      }
+      return origClimbFn(p, args, raw);
+    };
+  }
 };
