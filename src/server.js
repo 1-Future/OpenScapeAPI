@@ -1622,7 +1622,7 @@ commands.register('say', { help: 'Public chat: say [message]', aliases: ['chat']
   }
 });
 
-commands.register('pm', { help: 'Private message: pm [player] [message]', aliases: ['whisper', 'w', 'tell'], category: 'Social',
+commands.register('pm', { help: 'Private message: pm [player] [message]', aliases: ['whisper', 'tell'], category: 'Social',
   fn: (p, args) => {
     if (args.length < 2) return 'Usage: pm [player] [message]';
     const target = findPlayer(args[0]);
