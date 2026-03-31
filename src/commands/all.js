@@ -627,9 +627,12 @@ module.exports = function registerAll(ctx) {
       for (const [courseId, course] of Object.entries(AGILITY_COURSES)) {
         for (let i = 0; i < course.obstacles.length; i++) {
           const obs = course.obstacles[i];
-          if (obs.name.toLowerCase().includes(name)) {
+          // Match by obstacle name or definition id (e.g. "wall", "low wall", "agility_wall")
+          const obsLower = obs.name.toLowerCase();
+          const defLower = (obs.defId || '').toLowerCase().replace(/_/g, ' ');
+          if (obsLower.includes(name) || obsLower === name || defLower.includes(name) || name.includes(obsLower)) {
             const dist = Math.max(Math.abs(p.x - obs.x), Math.abs(p.y - obs.y));
-            if (dist <= 3) { foundCourse = { id: courseId, ...course }; foundObstacle = obs; foundIdx = i; break; }
+            if (dist <= 10) { foundCourse = { id: courseId, ...course }; foundObstacle = obs; foundIdx = i; break; }
           }
         }
         if (foundObstacle) break;
@@ -675,8 +678,8 @@ module.exports = function registerAll(ctx) {
       if (!name) return 'Usage: pickpocket [npc name]';
       if (p.stunTicks > 0) return `You are stunned! (${p.stunTicks} ticks remaining)`;
 
-      const npc = npcs.findNpcByName(name, p.x, p.y, 2, p.layer);
-      if (!npc) return `No "${name}" nearby.`;
+      const npc = npcs.findNpcByName(name, p.x, p.y, 10, p.layer);
+      if (!npc) return `No "${name}" nearby. Type \`nearby\` to see who's around.`;
 
       const npcDef = npcs.npcDefs.get(npc.defId);
       if (!npcDef || !npcDef.thieving) return `You can't pickpocket the ${npc.name}.`;
@@ -771,6 +774,245 @@ module.exports = function registerAll(ctx) {
     fn: (p) => {
       updateWeight(p);
       return `Weight: ${p.weight.toFixed(1)} kg`;
+    }
+  });
+
+  // ── Map Command ───────────────────────────────────────────────────────────
+  commands.register('map', { help: 'Show ASCII map of surroundings (15x15)', category: 'Navigation',
+    fn: (p) => {
+      const T = tiles.T;
+      const RADIUS = 7; // 15x15 grid = radius 7
+      const TILE_CHARS = {
+        [T.EMPTY]: 'X', [T.GRASS]: '.', [T.WATER]: '~', [T.TREE]: 'T',
+        [T.PATH]: '=', [T.ROCK]: '#', [T.SAND]: 'S', [T.WALL]: '#',
+        [T.FLOOR]: '.', [T.DOOR]: 'D', [T.BRIDGE]: '=', [T.FISH_SPOT]: '~',
+        [T.FLOWER]: ',', [T.BUSH]: 'b', [T.DARK_GRASS]: '.', [T.SNOW]: '*',
+        [T.LAVA]: '!', [T.SWAMP]: '%',
+      };
+
+      // Build sets of NPC and object positions for quick lookup
+      const npcPositions = new Map();
+      const nearNpcs = npcs.getNpcsNear(p.x, p.y, RADIUS, p.layer);
+      for (const n of nearNpcs) npcPositions.set(`${n.x},${n.y}`, n);
+
+      const objPositions = new Map();
+      const nearObjs = objects.getObjectsNear(p.x, p.y, RADIUS, p.layer);
+      for (const o of nearObjs) if (!o.depleted) objPositions.set(`${o.x},${o.y}`, o);
+
+      const playerPositions = new Map();
+      for (const [, pl] of players) {
+        if (pl !== p && pl.connected && pl.layer === p.layer &&
+            Math.abs(pl.x - p.x) <= RADIUS && Math.abs(pl.y - p.y) <= RADIUS) {
+          playerPositions.set(`${pl.x},${pl.y}`, pl);
+        }
+      }
+
+      let map = '    ';
+      // Column headers
+      for (let dx = -RADIUS; dx <= RADIUS; dx++) {
+        map += (dx === 0) ? 'v' : ' ';
+      }
+      map += '\n';
+
+      for (let dy = -RADIUS; dy <= RADIUS; dy++) {
+        const worldY = p.y + dy;
+        map += (dy === 0) ? ' > ' : '   ';
+        map += ' ';
+        for (let dx = -RADIUS; dx <= RADIUS; dx++) {
+          const worldX = p.x + dx;
+          const key = `${worldX},${worldY}`;
+
+          if (dx === 0 && dy === 0) {
+            map += '@'; // Player
+          } else if (playerPositions.has(key)) {
+            map += 'P';
+          } else if (npcPositions.has(key)) {
+            map += '!';
+          } else if (objPositions.has(key)) {
+            map += '?';
+          } else {
+            const tile = tiles.tileAt(worldX, worldY, p.layer);
+            map += TILE_CHARS[tile] || 'X';
+          }
+        }
+        map += '\n';
+      }
+
+      map += '\nLegend: @ You  ! NPC  ? Object  P Player  # Wall/Rock  T Tree';
+      map += '\n        ~ Water  . Grass/Floor  = Path  S Sand  D Door  X Unwalkable';
+      const area = tiles.getArea(p.x, p.y, p.layer);
+      if (area) map += `\nArea: ${area.name}`;
+      return map;
+    }
+  });
+
+  // ── Nearby Command ────────────────────────────────────────────────────────
+  commands.register('nearby', { help: 'List everything within 10 tiles', category: 'Navigation',
+    fn: (p) => {
+      const RANGE = 10;
+      let out = `=== Nearby (within ${RANGE} tiles) ===`;
+
+      // NPCs
+      const nearNpcs = npcs.getNpcsNear(p.x, p.y, RANGE, p.layer);
+      if (nearNpcs.length) {
+        out += '\n\n-- NPCs --';
+        for (const n of nearNpcs) {
+          const dist = Math.max(Math.abs(n.x - p.x), Math.abs(n.y - p.y));
+          const dir = getDirection(p.x, p.y, n.x, n.y);
+          out += `\n  ${n.name} (lvl ${n.combat}) - ${dist} tiles ${dir} (${n.x},${n.y})`;
+        }
+      }
+
+      // Objects
+      const nearObjs = objects.getObjectsNear(p.x, p.y, RANGE, p.layer);
+      const activeObjs = nearObjs.filter(o => !o.depleted);
+      if (activeObjs.length) {
+        out += '\n\n-- Objects --';
+        for (const o of activeObjs) {
+          const dist = Math.max(Math.abs(o.x - p.x), Math.abs(o.y - p.y));
+          const dir = getDirection(p.x, p.y, o.x, o.y);
+          out += `\n  ${o.name} - ${dist} tiles ${dir} (${o.x},${o.y})`;
+        }
+      }
+
+      // Ground items
+      const nearItems = groundItems.filter(i =>
+        Math.abs(i.x - p.x) <= RANGE && Math.abs(i.y - p.y) <= RANGE && i.layer === p.layer
+      );
+      if (nearItems.length) {
+        out += '\n\n-- Items --';
+        for (const i of nearItems) {
+          const dist = Math.max(Math.abs(i.x - p.x), Math.abs(i.y - p.y));
+          const dir = getDirection(p.x, p.y, i.x, i.y);
+          out += `\n  ${i.name} x${i.count} - ${dist} tiles ${dir} (${i.x},${i.y})`;
+        }
+      }
+
+      // Players
+      const nearPlayers = [];
+      for (const [, pl] of players) {
+        if (pl !== p && pl.connected && pl.layer === p.layer &&
+            Math.abs(pl.x - p.x) <= RANGE && Math.abs(pl.y - p.y) <= RANGE) {
+          nearPlayers.push(pl);
+        }
+      }
+      if (nearPlayers.length) {
+        out += '\n\n-- Players --';
+        for (const pl of nearPlayers) {
+          const dist = Math.max(Math.abs(pl.x - p.x), Math.abs(pl.y - p.y));
+          const dir = getDirection(p.x, p.y, pl.x, pl.y);
+          out += `\n  ${pl.name} (combat ${combatLevel(pl)}) - ${dist} tiles ${dir}`;
+        }
+      }
+
+      // Exits / paths to other areas
+      const currentArea = tiles.getArea(p.x, p.y, p.layer);
+      const areasSeen = new Set();
+      if (currentArea) areasSeen.add(currentArea.id);
+      const exits = [];
+      for (let dx = -RANGE; dx <= RANGE; dx++) {
+        for (let dy = -RANGE; dy <= RANGE; dy++) {
+          const wx = p.x + dx, wy = p.y + dy;
+          const a = tiles.getArea(wx, wy, p.layer);
+          if (a && !areasSeen.has(a.id)) {
+            areasSeen.add(a.id);
+            const dist = Math.max(Math.abs(dx), Math.abs(dy));
+            const dir = getDirection(p.x, p.y, wx, wy);
+            exits.push({ name: a.name, dist, dir });
+          }
+        }
+      }
+      if (exits.length) {
+        out += '\n\n-- Exits / Nearby Areas --';
+        exits.sort((a, b) => a.dist - b.dist);
+        for (const e of exits) {
+          out += `\n  ${e.name} - ${e.dist} tiles ${e.dir}`;
+        }
+      }
+
+      return out;
+    }
+  });
+
+  // Direction helper for nearby/map
+  function getDirection(fromX, fromY, toX, toY) {
+    const dx = toX - fromX, dy = toY - fromY;
+    if (dx === 0 && dy === 0) return 'here';
+    let dir = '';
+    if (dy < 0) dir += 'N';
+    if (dy > 0) dir += 'S';
+    if (dx < 0) dir += 'W';
+    if (dx > 0) dir += 'E';
+    return dir;
+  }
+
+  // ── Status Command ────────────────────────────────────────────────────────
+  commands.register('status', { help: 'Show detailed player status', category: 'General',
+    fn: (p) => {
+      updateWeight(p);
+      const cb = combatLevel(p);
+      let out = '=== Status ===';
+      out += `\nHP: ${p.hp}/${p.maxHp}`;
+      out += `\nPrayer: ${p.prayerPoints}/${getLevel(p, 'prayer')}`;
+      out += `\nRun Energy: ${(p.runEnergy / 100).toFixed(0)}%${p.running ? ' (running)' : ''}`;
+      out += `\nWeight: ${p.weight.toFixed(1)} kg`;
+      out += `\nCombat Level: ${cb}`;
+      out += `\nSpecial Attack: ${(p.specialEnergy / 10).toFixed(0)}%`;
+
+      // Current action
+      if (p.busy && p.busyAction) {
+        out += `\nCurrent Action: ${p.busyAction}`;
+      } else if (p.combatTarget) {
+        const npc = npcs.getNpc(p.combatTarget);
+        out += `\nCurrent Action: Fighting ${npc ? npc.name : 'unknown'}`;
+      } else if (p.pvpTarget) {
+        out += `\nCurrent Action: PvP combat`;
+      } else if (p.path.length > 0) {
+        out += `\nCurrent Action: Walking (${p.path.length} steps remaining)`;
+      }
+
+      // Active boosts
+      if (p.boosts && Object.keys(p.boosts).length > 0) {
+        out += '\nActive Boosts:';
+        for (const [skill, boost] of Object.entries(p.boosts)) {
+          if (boost.ticksLeft > 0) {
+            out += `\n  ${skill}: +${boost.amount} (${boost.ticksLeft} ticks left)`;
+          }
+        }
+      }
+
+      // Active prayers
+      if (p.activePrayers && p.activePrayers.size > 0) {
+        out += `\nActive Prayers: ${[...p.activePrayers].join(', ')}`;
+      }
+
+      // Slayer task
+      if (p.slayerTask) {
+        out += `\nSlayer Task: ${p.slayerTask.monster} (${p.slayerTask.remaining} remaining)`;
+      }
+
+      // Wilderness level
+      if (p.y <= 55) {
+        const wildyLevel = 55 - p.y;
+        out += `\nWilderness Level: ${wildyLevel} (PvP enabled!)`;
+      }
+
+      // Skull timer
+      if (p.skull > 0) {
+        out += `\nSkull Timer: ${p.skull} ticks remaining`;
+      }
+
+      // Stun
+      if (p.stunTicks > 0) {
+        out += `\nStunned: ${p.stunTicks} ticks remaining`;
+      }
+
+      // Position and area
+      out += `\nPosition: (${p.x}, ${p.y}) Layer ${p.layer}`;
+      const area = tiles.getArea(p.x, p.y, p.layer);
+      if (area) out += `\nArea: ${area.name}`;
+
+      return out;
     }
   });
 };

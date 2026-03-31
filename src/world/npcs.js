@@ -24,6 +24,7 @@ function defineNpc(defId, opts) {
     respawnTicks: opts.respawnTicks || 50,
     drops: opts.drops || [], // [{ id, name, weight, min, max }]
     dialogue: opts.dialogue || null,
+    thieving: opts.thieving || null, // { level, xp, loot, stunDamage }
   });
 }
 

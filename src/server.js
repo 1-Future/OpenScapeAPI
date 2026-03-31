@@ -1392,9 +1392,28 @@ function createDefaultContent() {
   function fillArea(x1, y1, x2, y2, tile) {
     for (let x = x1; x <= x2; x++) for (let y = y1; y <= y2; y++) tiles.setTile(x, y, tile);
   }
+  // Draw a 1-tile-wide L-shaped path (horizontal first at y1, then vertical at x2)
   function pathLine(x1, y1, x2, y2) {
     if (x1 !== x2) { const s = x1 < x2 ? 1 : -1; for (let x = x1; x !== x2 + s; x += s) tiles.setTile(x, y1, T.PATH); }
     if (y1 !== y2) { const s = y1 < y2 ? 1 : -1; for (let y = y1; y !== y2 + s; y += s) tiles.setTile(x2, y, T.PATH); }
+  }
+  // Draw a 3-tile-wide path between two points for reliable pathfinding
+  function widePath(x1, y1, x2, y2) {
+    pathLine(x1, y1, x2, y2);
+    // Widen by 1 tile on each side perpendicular to the path direction
+    if (x1 === x2) {
+      // Vertical path — widen left and right
+      pathLine(x1 - 1, y1, x2 - 1, y2);
+      pathLine(x1 + 1, y1, x2 + 1, y2);
+    } else if (y1 === y2) {
+      // Horizontal path — widen up and down
+      pathLine(x1, y1 - 1, x2, y2 - 1);
+      pathLine(x1, y1 + 1, x2, y2 + 1);
+    } else {
+      // L-shaped — widen both segments
+      pathLine(x1, y1 - 1, x2, y1 - 1); pathLine(x1, y1 + 1, x2, y1 + 1); // horizontal segment
+      pathLine(x2 - 1, y1, x2 - 1, y2); pathLine(x2 + 1, y1, x2 + 1, y2); // vertical segment
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1411,7 +1430,9 @@ function createDefaultContent() {
   const spawnRocks = [[106, 106], [107, 107], [108, 106]];
   for (const [x, y] of spawnRocks) { tiles.setTile(x, y, T.ROCK); objects.placeObject('copper_rock', x, y); }
   tiles.setTile(109, 106, T.ROCK); objects.placeObject('tin_rock', 109, 106);
-  tiles.setTile(96, 104, T.FISH_SPOT); objects.placeObject('fishing_spot', 96, 104);
+  // Fishing spot is WATER (unwalkable), adjacent tile (97,104) is grass/sand so player can fish from there
+  tiles.setTile(96, 104, T.WATER); objects.placeObject('fishing_spot', 96, 104);
+  tiles.setTile(97, 104, T.SAND); // Ensure adjacent tile is walkable for fishing
 
   // ═══════════════════════════════════════════════════════════════════════════
   // TOWN (90-115, 80-95) — shops, bank, crafting stations
@@ -1508,12 +1529,18 @@ function createDefaultContent() {
   fillArea(85, 121, 95, 125, T.WATER);
   fillArea(88, 120, 92, 122, T.FLOOR); // dock walkway
   tiles.defineArea('dock', { name: 'Fishing Dock', x1: 85, y1: 115, x2: 95, y2: 125 });
-  tiles.setTile(88, 123, T.FISH_SPOT); objects.placeObject('fishing_spot', 88, 123);
-  tiles.setTile(89, 123, T.FISH_SPOT); objects.placeObject('fishing_spot', 89, 123);
-  tiles.setTile(90, 123, T.FISH_SPOT); objects.placeObject('fishing_spot', 90, 123);
-  tiles.setTile(91, 123, T.FISH_SPOT); objects.placeObject('fly_fishing_spot', 91, 123);
-  tiles.setTile(92, 123, T.FISH_SPOT); objects.placeObject('fly_fishing_spot', 92, 123);
-  tiles.setTile(88, 124, T.FISH_SPOT); objects.placeObject('cage_fishing_spot', 88, 124);
+  // Fishing spots are WATER tiles (unwalkable) — player fishes from adjacent walkable tiles
+  tiles.setTile(88, 123, T.WATER); objects.placeObject('fishing_spot', 88, 123);
+  tiles.setTile(89, 123, T.WATER); objects.placeObject('fishing_spot', 89, 123);
+  tiles.setTile(90, 123, T.WATER); objects.placeObject('fishing_spot', 90, 123);
+  tiles.setTile(91, 123, T.WATER); objects.placeObject('fly_fishing_spot', 91, 123);
+  tiles.setTile(92, 123, T.WATER); objects.placeObject('fly_fishing_spot', 92, 123);
+  tiles.setTile(88, 124, T.WATER); objects.placeObject('cage_fishing_spot', 88, 124);
+  // Ensure dock walkway extends to be adjacent to all fishing spots
+  fillArea(87, 120, 93, 122, T.FLOOR); // Extend dock walkway so all fishing spots are reachable
+  // Add sand tiles beside the cage spot so it's reachable from the west
+  tiles.setTile(87, 124, T.SAND);
+  tiles.setTile(87, 123, T.SAND);
   npcs.spawnNpc('fishing_tutor', 90, 118);
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1553,24 +1580,49 @@ function createDefaultContent() {
   npcs.spawnNpc('green_dragon', 130, 45); npcs.spawnNpc('green_dragon', 135, 48);
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // PATH NETWORK — connect all areas
+  // PATH NETWORK — connect all areas with continuous walkable tiles
   // ═══════════════════════════════════════════════════════════════════════════
-  pathLine(100, 95, 100, 80);       // Spawn to Town
-  pathLine(95, 100, 75, 100);       // Spawn to Fields
-  pathLine(90, 100, 90, 95);        // Fields to Town SW
-  pathLine(105, 100, 115, 100);     // Spawn to Mining Site
+  // Widen spawn exits so circular island connects cleanly to rectangular areas
+  // North exit: spawn (100, 95) to town top (100, 80)
+  widePath(100, 95, 100, 80);
+  // West exit: spawn (95, 100) to fields (75, 100)
+  widePath(95, 100, 75, 100);
+  // East exit: spawn (105, 100) to mining (115, 100)
+  widePath(105, 100, 115, 100);
+  // South exit: spawn (100, 105) to dock area (100, 115)
+  widePath(100, 105, 100, 115);
+
+  // Area-to-area connections
+  pathLine(90, 100, 90, 95);        // Fields to Town SW corner
+  pathLine(89, 100, 89, 95);        // widen
+  pathLine(91, 100, 91, 95);        // widen
   pathLine(115, 100, 115, 115);     // Mining path south
-  pathLine(100, 105, 100, 115);     // Spawn to Dock
-  pathLine(90, 115, 100, 115);      // Dock to spawn path
-  pathLine(90, 85, 80, 85);         // Town to Forest
-  pathLine(80, 85, 80, 95);         // Forest path south
-  pathLine(115, 90, 120, 90);       // Town to Giant Plains
-  pathLine(75, 70, 75, 60);         // Forest to Goblin Village
-  pathLine(70, 70, 80, 70);         // Goblin Village east-west
-  pathLine(100, 80, 100, 56);       // Town to Wilderness Border
+  pathLine(90, 115, 100, 115);      // Dock to spawn path (east-west)
+  pathLine(90, 116, 100, 116);      // widen dock connection
+  widePath(90, 85, 80, 85);         // Town to Forest
+  pathLine(80, 85, 80, 95);         // Forest path south to fields
+  pathLine(79, 85, 79, 95);         // widen
+  pathLine(81, 85, 81, 95);         // widen
+  widePath(115, 90, 120, 90);       // Town to Giant Plains
+  widePath(75, 70, 75, 60);         // Forest to Goblin Village
+  pathLine(70, 70, 80, 70);         // Goblin Village east-west path
+  pathLine(70, 69, 80, 69);         // widen
+  widePath(100, 80, 100, 56);       // Town to Wilderness Border
   pathLine(80, 56, 120, 56);        // Wilderness border east-west
+  pathLine(80, 57, 120, 57);        // widen wilderness border path
   pathLine(85, 110, 85, 115);       // Fields to Dock
+  pathLine(86, 110, 86, 115);       // widen
   pathLine(120, 100, 120, 90);      // Mining to Giant Plains
+  pathLine(121, 100, 121, 90);      // widen
+
+  // Fill in any remaining gap tiles around spawn circle edges
+  // Ensure spawn has walkable tiles at all cardinal exits
+  for (let d = -2; d <= 2; d++) {
+    tiles.setTile(100 + d, 95, T.PATH);   // North exit
+    tiles.setTile(100 + d, 105, T.PATH);  // South exit
+    tiles.setTile(95, 100 + d, T.PATH);   // West exit
+    tiles.setTile(105, 100 + d, T.PATH);  // East exit
+  }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // AGILITY COURSE — rooftop course in Town
