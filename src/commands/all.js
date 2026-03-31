@@ -873,8 +873,7 @@ module.exports = function registerAll(ctx) {
   });
 
   // ── Map Command ───────────────────────────────────────────────────────────
-  commands.register('map', { help: 'Show ASCII map of surroundings (15x15)', category: 'Navigation',
-    fn: (p) => {
+  function generateMap(p) {
       const T = tiles.T;
       const RADIUS = 7; // 15x15 grid = radius 7
       const TILE_CHARS = {
@@ -938,7 +937,13 @@ module.exports = function registerAll(ctx) {
       const area = tiles.getArea(p.x, p.y, p.layer);
       if (area) map += `\nArea: ${area.name}`;
       return map;
-    }
+  }
+
+  // Expose for use by movement commands
+  ctx.generateMap = generateMap;
+
+  commands.register('map', { help: 'Show ASCII map of surroundings (15x15)', category: 'Navigation',
+    fn: (p) => generateMap(p)
   });
 
   // ── Nearby Command ────────────────────────────────────────────────────────

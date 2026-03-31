@@ -895,6 +895,9 @@ commands.register('look', { help: 'Look around', aliases: ['l'], category: 'Navi
   }
 });
 
+// Shared context (populated by registerAllCommands later)
+let cmdCtx = {};
+
 // Direction shortcuts
 const DIR_MAP = { n: [0,-1], s: [0,1], e: [1,0], w: [-1,0], ne: [1,-1], nw: [-1,-1], se: [1,1], sw: [-1,1] };
 for (const [dir, [dx, dy]] of Object.entries(DIR_MAP)) {
@@ -904,9 +907,11 @@ for (const [dir, [dx, dy]] of Object.entries(DIR_MAP)) {
       if (!tiles.isWalkable(nx, ny, p.layer)) return `Blocked — ${tiles.getTileName(tiles.tileAt(nx, ny, p.layer))} is not walkable.`;
       if (walls.isEdgeBlocked(p.x, p.y, nx, ny, p.layer)) return 'Blocked — there\'s a wall in the way.';
       p.x = nx; p.y = ny;
+      if (actions.isActive(p)) actions.cancel(p);
       events.emit('player_move', { player: p });
-      const tile = tiles.getTileName(tiles.tileAt(p.x, p.y, p.layer));
-      return `Moved ${dir} to (${p.x}, ${p.y}). Ground: ${tile}.`;
+      let msg = `(${p.x}, ${p.y})`;
+      if (cmdCtx.generateMap) msg += '\n' + cmdCtx.generateMap(p);
+      return msg;
     }
   });
 }
@@ -2757,7 +2762,7 @@ tick.onTick('world', worldTick);
 tick.onTick('shops', (t) => shopSystem.restockTick(t));
 
 // Register all Tier 6-18 commands
-registerAllCommands({
+cmdCtx = {
   players, playersByName, groundItems, tick, events, persistence,
   tiles, walls, npcs, objects, pathfinding, combat, actions,
   getLevel, getXp, addXp, totalLevel, combatLevel,
@@ -2765,7 +2770,8 @@ registerAllCommands({
   invAdd, invRemove, invCount, invFreeSlots,
   send, sendText, broadcast, findPlayer, nextItemId,
   getLevelUpMessage, clans,
-});
+};
+registerAllCommands(cmdCtx);
 
 // Persistence
 persistence.onSave('chunks', () => tiles.saveChunks());
